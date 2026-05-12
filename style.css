@@ -1,0 +1,50 @@
+#ff4_vir_lorebook_sync_settings .ff4-vir-help {
+    opacity: 0.78;
+    font-size: 0.9em;
+    margin: 4px 0 10px;
+    line-height: 1.35;
+}
+
+#ff4_vir_lorebook_sync_settings .ff4-vir-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin: 8px 0;
+}
+
+#ff4_vir_lorebook_sync_settings .ff4-vir-status {
+    padding: 8px;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 6px;
+    background: var(--SmartThemeBlurTintColor);
+    word-break: break-word;
+    line-height: 1.45;
+}
+
+#ff4_vir_lorebook_sync_settings .ff4-vir-audit {
+    padding: 8px;
+    margin-top: 8px;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 6px;
+    background: var(--black30a);
+    line-height: 1.35;
+}
+
+#ff4_vir_lorebook_sync_settings .ff4-vir-warning {
+    margin-top: 5px;
+    color: var(--warning, #d7a900);
+    word-break: break-word;
+}
+
+#ff4_vir_lorebook_sync_settings .ff4-vir-muted {
+    margin-top: 5px;
+    opacity: 0.7;
+}
+
+#ff4_vir_lorebook_sync_settings .ff4-vir-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 10px;
+}

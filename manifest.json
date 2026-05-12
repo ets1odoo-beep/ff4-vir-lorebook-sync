@@ -1,0 +1,10 @@
+{
+    "display_name": "FF4 VIR Lorebook Sync",
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "knav0",
+    "version": "1.0.0",
+    "auto_update": false
+}
