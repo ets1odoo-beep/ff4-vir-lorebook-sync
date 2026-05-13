@@ -48,3 +48,48 @@
     gap: 8px;
     margin-top: 10px;
 }
+
+#ff4_vir_lorebook_sync_settings .ff4-vir-section {
+    padding: 8px;
+    margin-top: 8px;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 6px;
+    background: var(--SmartThemeBlurTintColor);
+}
+
+#ff4_vir_lorebook_sync_settings .ff4-vir-section > b {
+    display: block;
+    margin-bottom: 4px;
+}
+
+#ff4_vir_lorebook_sync_settings .ff4-vir-char-list {
+    max-height: 220px;
+    overflow-y: auto;
+    margin: 6px 0;
+}
+
+#ff4_vir_lorebook_sync_settings .ff4-vir-char-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 2px;
+    border-bottom: 1px solid var(--black20a);
+}
+
+#ff4_vir_lorebook_sync_settings .ff4-vir-char-tier {
+    font-size: 0.8em;
+    min-width: 80px;
+    opacity: 0.85;
+}
+
+#ff4_vir_lorebook_sync_settings .ff4-vir-char-name {
+    flex: 1;
+    word-break: break-word;
+    font-weight: 500;
+}
+
+#ff4_vir_lorebook_sync_settings .ff4-vir-pin-btn {
+    font-size: 0.8em;
+    padding: 2px 8px;
+    min-width: 50px;
+}

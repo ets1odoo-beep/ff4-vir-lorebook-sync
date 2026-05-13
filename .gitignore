@@ -1,7 +1,4 @@
-# SillyTavern Extension Gitignore
-index.js.bak-*
-style.css.bak-*
 *.bak-*
-node_modules/
+*.bak
 .DS_Store
-Thumbs.db
+node_modules/
