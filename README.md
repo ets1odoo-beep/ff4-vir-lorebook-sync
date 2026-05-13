@@ -4,12 +4,10 @@
 
 ## 🚀 Key Features
 
-- **Automated Synchronization**: Automatically detects `<vir_sync>` packets in model responses and updates character entries in real-time.
-- **Dynamic Lorebook Management**: Creates and maintains chat-specific Lorebooks (prefixed with `FF4 VIR - `) to prevent attribute leakage between different stories.
-- **Visual Trait Enforcement**: Tracks mandatory fields such as `species`, `height`, `hair`, `eyes`, `skin_fur_scales`, and `outfit`.
-- **Narrative Consistency**: Handles complex identity canonicalization, stripping scenario noise and normalizing character names for perfect prompt matching.
-- **Auto-Cleanup**: Intelligently removes orphaned Lorebooks when chats are deleted to keep your "Worlds" directory clean.
-- **Debug & Monitoring**: Built-in status tracking and warning system to alert you when visual traits are missing or malformed.
+- **Tiered Injection Strategy**: New three-tier system (Pinned/Active/Offscreen) for optimal token management and visual persistence.
+- **Compact Scene Index**: Significant token savings with a new compact format for tracking scene states.
+- **Character Management UI**: Dedicated panel to pin main characters and monitor VIR completeness.
+- **Race-Safe Processing**: Async queue handling for multi-packet streaming responses.
 
 ## 🛠️ Installation
 
@@ -52,4 +50,4 @@ Available in the extension settings panel:
 
 ---
 **Author:** [ets1odoo-beep](https://github.com/ets1odoo-beep)  
-**Version:** 1.0.0
+**Version:** 3.0.0
