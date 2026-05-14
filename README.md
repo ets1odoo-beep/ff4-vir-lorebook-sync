@@ -4,10 +4,11 @@
 
 ## 🚀 Key Features
 
-- **Tiered Injection Strategy**: New three-tier system (Pinned/Active/Offscreen) for optimal token management and visual persistence.
-- **Compact Scene Index**: Significant token savings with a new compact format for tracking scene states.
-- **Character Management UI**: Dedicated panel to pin main characters and monitor VIR completeness.
-- **Race-Safe Processing**: Async queue handling for multi-packet streaming responses.
+- **Peak Unrestricted RP Engine**: Strict token discipline with 70-80% overhead reduction.
+- **Dynamic Watchdogs**: Real-time detection of banned vocabulary, repetition, shape monotony, and user-input echoing.
+- **Unified State Builder**: Consolidates scene, time, geometry, and relationships into a single efficient block.
+- **Character State Machine**: Tracks injuries, fluids, and emotional registers with automated decay.
+- **Advanced Mode Sync**: Extension-driven control over agency modes, cynicism, and POV/tense modifiers.
 
 ## 🛠️ Installation
 
@@ -50,4 +51,4 @@ Available in the extension settings panel:
 
 ---
 **Author:** [ets1odoo-beep](https://github.com/ets1odoo-beep)  
-**Version:** 3.0.0
+**Version:** 4.0.0
