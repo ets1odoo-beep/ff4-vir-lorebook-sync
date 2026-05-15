@@ -720,7 +720,8 @@ function findOrphanSyncBlocks(text) {
     if (!text) return [];
     const results = [];
     let cursor = 0;
-    const OPEN_RE = /\{\s*"schema"\s*:\s*[12]\s*,/g;
+    // Accept schema 1, 2, OR 3 (flat shape introduced in v5.0.0).
+    const OPEN_RE = /\{\s*"schema"\s*:\s*[123]\s*,/g;
     while (true) {
         OPEN_RE.lastIndex = cursor;
         const open = OPEN_RE.exec(text);
@@ -738,7 +739,9 @@ function findOrphanSyncBlocks(text) {
         }
         if (end === -1) break;
         const blob = text.slice(start, end);
-        if (/"(?:new_characters|vir_delta|scene_state|char_state)"/.test(blob)) {
+        // Schema 1/2 markers: new_characters / vir_delta / scene_state / char_state
+        // Schema 3 markers: characters (array) / states (array) / scene / recall
+        if (/"(?:new_characters|vir_delta|scene_state|char_state|characters|states|scene|recall)"/.test(blob)) {
             results.push({ start, end, text: blob });
         }
         cursor = end;
@@ -917,41 +920,52 @@ function stripOrphanSyncBlocks(text) {
     }
     return out;
 }
+// SURGICAL — find each `{...}` JSON object that looks like a VIR packet
+// (has 3+ VIR keys) and remove ONLY that object. Walks braces with string/escape
+// awareness. Never deletes content outside the matched braces — critical for
+// preserving <pic prompt="..."> tags that may follow the JSON in the message.
 function stripVirKeyFragments(text) {
     if (!text) return text;
-    const TAIL = 5000;
-    const tailStart = Math.max(0, text.length - TAIL);
-    const maskedFull = maskCodeFences(text);  // protects RPG HUD's ```rpg block etc.
-    const maskedTail = maskedFull.slice(tailStart);
-    // All keys across schema 1/2/3. Covers schema-2's deeply nested keys
-    // (geometry, relationships, aftermath_marks, vad, scene_id) AND schema-3
-    // flat keys (characters, scene, states, recall).
     const KEY_RE = /"(?:schema|characters|new_characters|vir_delta|scene|scene_state|char_state|states|active|active_characters|outfit_layers|hair_state|body_fluids|voice_lock|voice_color|voice_gender|voice_vocab|voice_profanity|dialogue_color|face_features|skin_fur_scales|recall|recall_characters|aftermath|aftermath_marks|geometry|relationships|vad|scene_id|position|injuries)"\s*:/g;
-    const hits = [];
-    let m;
-    KEY_RE.lastIndex = 0;
-    while ((m = KEY_RE.exec(maskedTail)) !== null) hits.push(m.index);
-    if (hits.length < 3) return text;
-    const firstHit = hits[0];
-    let fragStart = firstHit;
-    for (let i = firstHit - 1; i >= 0; i--) {
-        const maskedCh = maskedTail[i];
-        const origCh = text[tailStart + i];
-        // Stop if we're crossing into a masked (fenced) region
-        if (maskedCh === ' ' && origCh !== ' ' && origCh !== '\t' && origCh !== '\n' && origCh !== '\r') break;
-        if (/[\s,{}[\]":\\\w.\-+]/.test(maskedCh)) fragStart = i;
-        else break;
-    }
-    if (firstHit - fragStart > 800) {
-        fragStart = firstHit;
-        for (let i = firstHit - 1; i >= 0; i--) {
-            if (maskedTail[i] === '\n') { fragStart = i + 1; break; }
+    const masked = maskCodeFences(text); // protect RPG HUD's ```rpg, ```vir already-stripped, etc.
+    const removals = []; // { start, end } byte ranges to delete
+    // Scan for `{` that opens an object containing 3+ VIR keys; remove that object.
+    let i = 0;
+    while (i < masked.length) {
+        if (masked[i] !== '{') { i++; continue; }
+        let depth = 0, inStr = false, escape = false, end = -1;
+        for (let j = i; j < masked.length; j++) {
+            const ch = masked[j];
+            if (escape) { escape = false; continue; }
+            if (ch === '\\') { escape = true; continue; }
+            if (ch === '"') { inStr = !inStr; continue; }
+            if (inStr) continue;
+            if (ch === '{') depth++;
+            else if (ch === '}') { depth--; if (depth === 0) { end = j + 1; break; } }
+        }
+        if (end === -1) break; // unbalanced — bail, leave message alone
+        const blob = masked.slice(i, end);
+        // Count VIR keys inside this top-level object. 3+ = VIR packet.
+        KEY_RE.lastIndex = 0;
+        let keyHits = 0;
+        while (KEY_RE.exec(blob) !== null) {
+            keyHits++;
+            if (keyHits >= 3) break;
+        }
+        if (keyHits >= 3) {
+            removals.push({ start: i, end });
+            i = end;
+        } else {
+            i++;
         }
     }
-    const absStart = tailStart + fragStart;
-    const sliceToStrip = text.slice(absStart);
-    if (sliceToStrip.includes('```')) return text;
-    return text.slice(0, absStart).trimEnd();
+    if (!removals.length) return text;
+    // Apply removals back-to-front so indices stay valid.
+    let out = text;
+    for (let r = removals.length - 1; r >= 0; r--) {
+        out = out.slice(0, removals[r].start) + out.slice(removals[r].end);
+    }
+    return out.replace(/\n{3,}/g, '\n\n');
 }
 function stripVirFromMessage(text, processedRaw) {
     let updated = text || '';
@@ -1328,7 +1342,14 @@ async function processMessage(messageId) {
                 message.mes = cleaned;
             }
         }
-        try { await context.saveChat(); } catch { /* ignore */ }
+        // NOTE: do NOT saveChat here. st-image-auto-generation runs ComfyUI
+        // asynchronously (seconds-to-minutes after MESSAGE_RECEIVED) and saves
+        // chat itself once the image markdown is spliced into message.mes.
+        // Saving here would persist a pre-image snapshot; if the user reloads
+        // before the image arrives there'd still be no problem, but if we save
+        // multiple times in quick succession there's a real risk of a stale
+        // write racing the image extension's save. ST auto-saves on the next
+        // message anyway — leave it to the natural cadence.
 
         if (processedRaw.length || upsertedAll.size) {
             const upNote = upsertedAll.size ? ` (${[...upsertedAll].join(', ')})` : '';
