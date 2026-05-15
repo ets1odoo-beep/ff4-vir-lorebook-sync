@@ -98,99 +98,11 @@ let sessionPacketCount = 0;
 // ============================================================================
 // THE VIR CONTRACT — auto-injected as system prompt every generation
 // ============================================================================
-const VIR_CONTRACT = `<vir_contract>
-# VIR CONTRACT — auto-injected by FF4 VIR Lorebook Sync extension
-
-You run a Visual Identity Registry (VIR) state engine in parallel with the roleplay. The extension reads your \`vir\` code-fence block to track characters, scene state, and mutable conditions.
-
-## RULE 1 — OUTPUT FORMAT (NON-NEGOTIABLE)
-
-Every response MUST end with exactly ONE markdown code fence labeled \`vir\`:
-
-\`\`\`vir
-{...FLAT JSON HERE...}
-\`\`\`
-
-- Place at the ABSOLUTE END — after all prose, after \`<pic>\` tags, after Plot Momentum / RPG HUD / any other macro.
-- Single line of valid JSON. No comments. No trailing commas. ASCII quotes only.
-- The JSON is INTENTIONALLY FLAT — no deeply nested objects, no objects-keyed-by-name. Arrays of flat objects only.
-
-## RULE 2 — FLAT SCHEMA (matches RPG HUD's pattern for maximum parse reliability)
-
-\`\`\`vir
-{"schema":3,"characters":[{"name":"...","action":"create|update","species":"...","source":"...","age":"...","height":"...","hair":"...","eyes":"...","face":"...","brows":"...","lips":"...","skin":"...","body":"...","hands":"...","voice":"...","marks":"...","non_human":"...","outfit":"...","underwear":"...","accessories":"...","equipment":"...","voice_gender":"...","voice_vocab":"...","voice_profanity":"...","voice_signature":"...","voice_color":"#HEX"}],"scene":{"location":"...","time":"...","weather":"...","active":"Name1,Name2"},"states":[{"name":"...","outfit_state":"...","hair_state":"...","body_fluids":"...","injuries":"...","position":"...","aftermath":0}],"recall":["Name1","Name2"]}
-\`\`\`
-
-## RULE 3 — TOP-LEVEL KEYS (only 4)
-
-- \`characters\`: ARRAY of flat char objects. Each has \`name\` (required) + \`action\`:"create" for new chars OR "update" for permanent appearance changes (haircut, dye, scar). On "update", emit ONLY changed fields.
-- \`scene\`: ONE flat object — location, time, weather, active (comma-separated names of currently visible chars).
-- \`states\`: ARRAY of flat per-char mutable state objects. Each has \`name\` (required) + outfit_state / hair_state / body_fluids / injuries / position / aftermath (number).
-- \`recall\`: ARRAY of name strings — forcibly re-activate offscreen chars (use when char has been absent 10+ turns).
-
-## RULE 4 — FLAT FIELD CONVENTIONS (CRITICAL — no nesting allowed)
-
-- Multi-piece outfit/accessories/equipment/underwear: SEMICOLON-separated STRING, NOT array.
-  CORRECT: \`"outfit":"beige cotton tunic; brown leather belt; brown sandals"\`
-  WRONG:   \`"outfit":["beige cotton tunic","brown leather belt"]\`  (array — banned)
-
-- Voice info as FLAT \`voice_*\` fields, NOT a nested voice_lock object.
-  CORRECT: \`"voice_gender":"female","voice_vocab":"casual","voice_color":"#FFCC80"\`
-  WRONG:   \`"voice_lock":{"gender":"female","vocab_tier":"casual"}\`  (nested — banned)
-
-- Signature phrases as semicolon-separated string.
-  CORRECT: \`"voice_signature":"um; oh!; eh?"\`
-  WRONG:   \`"voice_signature":["um","oh!","eh?"]\`  (array — banned)
-
-- Active characters as comma-separated string.
-  CORRECT: \`"active":"Belne,Mara,ETS"\`
-  WRONG:   \`"active":["Belne","Mara","ETS"]\`  (array — banned)
-
-## RULE 5 — VOICE COLOR
-
-\`voice_color\` is a HEX code for character dialogue. Use LIGHT/BRIGHT colors readable on dark themes:
-#FF8A80 #FFAB91 #FFCC80 #FFE082 #FFF59D #A5D6A7 #80CBC4 #80DEEA #81D4FA #90CAF9 #B39DDB #CE93D8 #F48FB1 #F8BBD0 #E1BEE7 #FFD180
-
-Wrap each char's spoken dialogue in \`<font color='HEX'>"..."</font>\` using their assigned color from VIR context. Extension auto-assigns if missing.
-
-## RULE 6 — EXAMPLE (full reply showing one new char + scene + state)
-
-She steps closer, hands clasped at her waist.
-
-\`\`\`vir
-{"schema":3,"characters":[{"name":"Belne","action":"create","species":"goblin","source":"original","age":"adult","height":"147cm petite","hair":"dark green waist-length wavy ponytail","eyes":"orange round large","face":"soft small nose pointed ears","skin":"light mint-green smooth warm","body":"petite curvaceous large G-cup slim waist thick thighs","marks":"none","outfit":"beige cotton tunic; brown leather belt; brown sandals","accessories":"brass hoop earrings","voice_gender":"female","voice_vocab":"casual","voice_color":"#FFCC80"}],"scene":{"location":"inn common room","time":"evening","weather":"clear","active":"Belne"},"states":[{"name":"Belne","position":"standing beside bed","aftermath":0}]}
-\`\`\`
-
-## RULE 7 — MINIMAL EMISSION (when nothing changed)
-
-\`\`\`vir
-{"schema":3,"scene":{"active":"Belne"}}
-\`\`\`
-
-## RULE 8 — FORBIDDEN | CORRECT
-
-| FORBIDDEN | CORRECT |
-|-----------|---------|
-| Omitting the \`\`\`vir block | Always include as last thing in reply |
-| Multi-line JSON inside the fence | Single line of JSON |
-| Nested \`voice_lock\` object | Flat \`voice_*\` fields |
-| \`outfit\` as array | \`outfit\` as semicolon-separated string |
-| \`active\` as array | \`active\` as comma-separated string |
-| Object-keyed-by-name (\`{"Belne":{...}}\`) | Array of objects with name field (\`[{"name":"Belne",...}]\`) |
-| Trailing commas | No trailing commas |
-| Comments in JSON | No comments |
-| Fence mid-prose or inside \`<details>\`/\`<think>\` | Fence at absolute end, top-level |
-
-## RULE 9 — OUTPUT ORDER
-
-1. Prose / dialogue / inline \`<pic>\` tags
-2. Plot Momentum / RPG HUD / other tracker blocks
-3. The \`\`\`vir code-fence block (ALWAYS LAST)
-
-## RULE 10 — FIRST-TURN INIT
-
-On first reply with a new character, emit them as \`{"name":"...","action":"create",...}\` with ALL known fields populated. Skipping fields creates visual drift later.
-</vir_contract>`;
+// Minimal contract — just the format directive the parser needs to recognise.
+// All detailed rules (field conventions, color palette, FORBIDDEN/CORRECT,
+// output order) live in the user's preset. Keep this under ~500 chars so it
+// doesn't compete with preset content when injected at the chat tail.
+const VIR_CONTRACT = `End every reply with one \`\`\`vir code-fence block as the absolute last thing in the message (after prose, <pic> tags, and any other tracker blocks). Single line of flat JSON, schema 3: {"schema":3,"characters":[{"name":"...","action":"create|update",...flat fields...}],"scene":{"location":"...","time":"...","active":"Name1,Name2"},"states":[{"name":"...","position":"...","aftermath":0}],"recall":[]}. Arrays of name-keyed flat objects only — never nested objects keyed by name, never nested voice_lock. Multi-piece outfit/accessories use SEMICOLON-separated strings.`;
 
 // ============================================================================
 // SETTINGS / LOGGING
@@ -996,17 +908,28 @@ async function cleanupVirForDeletedChat(chatId) {
 // ============================================================================
 // VIR CONTRACT INJECTION (RPG-HUD-style — extension injects its own prompt)
 // ============================================================================
+// IN_CHAT depth strategy:
+//   VIR_CONTRACT (static schema rules) → depth 4, mid-deep reference
+//   VIR_STATE    (dynamic per-turn data) → depth 2, fresh per-turn
+// Both as role=system so the AI treats them as operating instructions, not
+// content. Preset's system block / world info / char description / chat history
+// remain untouched — these slot into the chat stream as system messages at the
+// chosen depths.
+const VIR_CONTRACT_DEPTH = 4;
+const VIR_STATE_DEPTH = 2;
+const POSITION_IN_CHAT = 2;
+
 function injectVirContract() {
     if (!settings().enabled || !settings().contractInjection) return;
     try {
         const ctx = getContext();
         const setExtensionPrompt = ctx?.setExtensionPrompt || window.setExtensionPrompt;
         if (typeof setExtensionPrompt !== 'function') return;
-        // POSITION 0 = top of system prompt (same as RPG HUD's updatePrompt).
-        // Maximum attention weight — AI sees the contract BEFORE any chat history,
-        // so it doesn't drift back to old schema patterns from earlier messages.
-        setExtensionPrompt('FF4_VIR_CONTRACT', VIR_CONTRACT, 0, 0, false, 'system');
-        log('VIR contract injected at position 0 (system top)');
+        // IN_CHAT depth 4 — sits 4 messages from the end of the chat stream
+        // as a system reminder. Far enough from the user input that it acts
+        // as background reference; close enough that the AI consults it.
+        setExtensionPrompt('FF4_VIR_CONTRACT', VIR_CONTRACT, POSITION_IN_CHAT, VIR_CONTRACT_DEPTH, false, 'system');
+        log(`VIR contract injected IN_CHAT depth ${VIR_CONTRACT_DEPTH}`);
     } catch (e) { warn('Contract injection failed', e); }
 }
 function clearVirContract() {
@@ -1014,8 +937,8 @@ function clearVirContract() {
         const ctx = getContext();
         const setExtensionPrompt = ctx?.setExtensionPrompt || window.setExtensionPrompt;
         if (typeof setExtensionPrompt !== 'function') return;
-        setExtensionPrompt('FF4_VIR_CONTRACT', '', 0, 0);
-        setExtensionPrompt('FF4_VIR_STATE', '', 0, 0);
+        setExtensionPrompt('FF4_VIR_CONTRACT', '', POSITION_IN_CHAT, VIR_CONTRACT_DEPTH);
+        setExtensionPrompt('FF4_VIR_STATE', '', POSITION_IN_CHAT, VIR_STATE_DEPTH);
     } catch { /* ignore */ }
 }
 
@@ -1068,9 +991,9 @@ async function buildVirStateText() {
 }
 
 /**
- * Refresh the dynamic VIR state injection. RPG-HUD-style:
- * setExtensionPrompt(EXT, text, 0, 0, false, 'system') = inject at top
- * of system prompt, before chat history.
+ * Refresh the dynamic VIR state injection. IN_CHAT depth 2 — fresher than the
+ * static contract (depth 4) because state changes every turn and needs the
+ * AI to consult it just before responding.
  */
 async function injectVirState() {
     if (!settings().enabled || !settings().contractInjection) return;
@@ -1080,11 +1003,11 @@ async function injectVirState() {
         if (typeof setExtensionPrompt !== 'function') return;
         const text = await buildVirStateText();
         if (!text) {
-            setExtensionPrompt('FF4_VIR_STATE', '', 0, 0);
+            setExtensionPrompt('FF4_VIR_STATE', '', POSITION_IN_CHAT, VIR_STATE_DEPTH);
             return;
         }
-        setExtensionPrompt('FF4_VIR_STATE', text, 0, 0, false, 'system');
-        log('VIR state injected (top-level)');
+        setExtensionPrompt('FF4_VIR_STATE', text, POSITION_IN_CHAT, VIR_STATE_DEPTH, false, 'system');
+        log(`VIR state injected IN_CHAT depth ${VIR_STATE_DEPTH}`);
     } catch (e) { warn('State injection failed', e); }
 }
 
