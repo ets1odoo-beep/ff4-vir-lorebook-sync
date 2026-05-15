@@ -1,7 +1,8 @@
-// FF4 VIR Lorebook Sync — v5.0.0 (clean rebuild, RPG-HUD-style architecture)
+// FF4 VIR Lorebook Sync — v5.1.1 (state entries removed from lorebook)
 // Auto-injects the VIR contract; AI emits ```vir code-fence blocks; extension
 // parses, updates lorebook entries dynamically (smart tier system), strips
-// JSON from visible chat. No preset edit required.
+// JSON from visible chat. Only character VIR cards + roster stored in lorebook.
+// Scene/state data is NOT stored — active chars derived from each VIR packet.
 
 import { extension_settings, getContext } from '../../../extensions.js';
 import {
@@ -28,7 +29,7 @@ import {
 // CONSTANTS
 // ============================================================================
 const EXT = 'ff4-vir-lorebook-sync';
-const VERSION = '5.0.0';
+const VERSION = '5.1.1';
 const WORLD_PREFIX = 'FF4 VIR - ';
 
 // Tier system — re-applied every sync based on scene_state
@@ -499,9 +500,18 @@ function activeNamesFrom(sync) {
     const names = new Set();
     for (const name of Object.keys(sync.new_characters || {})) names.add(name);
     for (const name of Object.keys(sync.vir_delta || {})) names.add(name);
-    for (const name of sync.scene_state?.active_characters || []) names.add(name);
-    for (const name of Object.keys(sync.scene_state?.characters || {})) {
-        if (sync.scene_state.characters[name]?.active !== false) names.add(name);
+    // Schema 3: scene.active (comma-separated string or array)
+    if (sync.scene?.active) {
+        const actives = typeof sync.scene.active === 'string'
+            ? sync.scene.active.split(/\s*,\s*/).filter(Boolean)
+            : Array.isArray(sync.scene.active) ? sync.scene.active : [];
+        for (const name of actives) names.add(name);
+    }
+    // Schema 3: characters[] with action !== 'update'
+    if (Array.isArray(sync.characters)) {
+        for (const char of sync.characters) {
+            if (char?.name && char.action !== 'update') names.add(char.name);
+        }
     }
     return names;
 }
@@ -534,114 +544,27 @@ function assignDialogueColors(data) {
 }
 
 // ============================================================================
-// FF4_STATE unified entry (replaces 4 separate state entries from v4)
+// FF4_STATE — REMOVED from lorebook (v5.1.0)
+// State is now injected via setExtensionPrompt only. This function cleans up
+// any leftover FF4_STATE lorebook entry from previous versions.
 // ============================================================================
-function buildFF4StateContent(data) {
-    const worldName = currentWorldName();
-    if (!worldName) return '';
-    const sceneEntry = Object.values(getEntries(data)).find(e => e?.comment === 'FF4 SCENE_STATE');
-    const scene = parseSceneState(sceneEntry);
-    const lines = ['[FF4_STATE]'];
-    if (scene.location) lines.push(`location: ${scene.location}`);
-    if (scene.time) lines.push(`time: ${scene.time}`);
-    if (scene.weather) lines.push(`weather: ${scene.weather}`);
-    const active = Array.isArray(scene.active_characters) ? scene.active_characters : [];
-    if (active.length) lines.push(`active: ${active.join(', ')}`);
-    // Per-char state
-    if (scene.characters) {
-        const stateBits = [];
-        for (const [n, s] of Object.entries(scene.characters)) {
-            if (!s) continue;
-            const parts = [];
-            if (s.outfit_state) parts.push(`outfit:${s.outfit_state}`);
-            if (s.hair_state) parts.push(`hair:${s.hair_state}`);
-            if (s.body_fluids) parts.push(`fluids:${s.body_fluids}`);
-            if (s.injuries) parts.push(`inj:${s.injuries}`);
-            if (s.aftermath) parts.push(`aftermath:${s.aftermath}`);
-            if (s.position) parts.push(`pos:${s.position}`);
-            if (parts.length) stateBits.push(`  ${n}: ${parts.join(' | ')}`);
-        }
-        if (stateBits.length) lines.push('char_state:'); lines.push(...stateBits);
-    }
-    // Dialogue colors for active chars only
-    const colorBits = [];
-    for (const [, entry] of characterEntries(data)) {
-        const name = characterEntryName(entry);
-        if (!name || !active.includes(name)) continue;
-        const vir = parseActiveVir(entry.content || '');
-        const color = vir?.voice_lock?.dialogue_color;
-        if (color) colorBits.push(`${name}=${color}`);
-    }
-    if (colorBits.length) lines.push(`dialogue_colors: ${colorBits.join(', ')}`);
-    // Recall info
-    const st = settings();
-    const recall = st.recallCharacters?.[worldName];
-    if (recall && Object.keys(recall).length) {
-        const recallBits = Object.entries(recall).map(([n, t]) => `${n}(${t}t)`);
-        lines.push(`recall: ${recallBits.join(', ')}`);
-    }
-    lines.push('[/FF4_STATE]');
-    return lines.join('\n');
-}
-function findFF4StateEntry(data) {
-    return Object.values(getEntries(data)).find(e => e?.comment === 'FF4 FF4_STATE');
-}
 function ensureFF4StateEntry(data) {
     const entries = getEntries(data);
-    let entry = findFF4StateEntry(data);
-    const content = buildFF4StateContent(data);
-    if (!entry) {
-        if (!content) return null;
-        const uid = nextUid(data);
-        entry = makeEntry({ uid, key: ['FF4_STATE'], comment: 'FF4 FF4_STATE', content, constant: true, order: 41, depth: 1, position: 0 });
-        entries[uid] = entry;
-    } else if (content) {
-        entry.content = content;
-    } else {
+    const entry = Object.values(entries).find(e => e?.comment === 'FF4 FF4_STATE');
+    if (entry) {
         delete entries[entry.uid];
+        log('Removed obsolete FF4 FF4_STATE lorebook entry');
     }
-    return entry;
 }
 
-// Scene state — single entry, merged not replaced
-function sceneStateContent(scene) {
-    if (!scene || !Object.keys(scene).length) return '';
-    return `[FF4_SCENE_STATE]\n${JSON.stringify(scene)}\n[/FF4_SCENE_STATE]`;
-}
-function parseSceneState(entry) {
-    if (!entry) return {};
-    const m = String(entry.content || '').match(/\[FF4_SCENE_STATE\]([\s\S]*?)\[\/FF4_SCENE_STATE\]/);
-    if (!m) return {};
-    try { return JSON.parse(m[1].trim()); } catch { return {}; }
-}
-function ensureSceneStateEntry(data, scene) {
+// SCENE_STATE — cleanup only: remove any leftover lorebook entry from previous versions
+function cleanupSceneStateEntry(data) {
     const entries = getEntries(data);
-    let entry = Object.values(entries).find(e => e?.comment === 'FF4 SCENE_STATE');
-    const content = sceneStateContent(scene);
-    if (!entry) {
-        if (!content) return null;
-        const uid = nextUid(data);
-        entry = makeEntry({ uid, key: ['SCENE_STATE'], comment: 'FF4 SCENE_STATE', content, constant: false, disable: true, order: 42, depth: 1, position: 0 });
-        entries[uid] = entry;
-    } else if (content) {
-        entry.content = content;
-        entry.disable = true;
+    const entry = Object.values(entries).find(e => e?.comment === 'FF4 SCENE_STATE');
+    if (entry) {
+        delete entries[entry.uid];
+        log('Removed obsolete FF4 SCENE_STATE lorebook entry');
     }
-    return entry;
-}
-function mergeSceneState(existing, incoming) {
-    const out = { ...(existing || {}) };
-    for (const [k, v] of Object.entries(incoming || {})) {
-        if (k === 'characters') {
-            out.characters = { ...(out.characters || {}) };
-            for (const [name, state] of Object.entries(v || {})) {
-                out.characters[name] = { ...(out.characters[name] || {}), ...state };
-            }
-        } else if (v !== undefined && v !== null) {
-            out[k] = v;
-        }
-    }
-    return out;
 }
 
 // ============================================================================
@@ -684,30 +607,18 @@ function rebuildRosterEntry(data) {
 }
 
 // ============================================================================
-// SCHEMA RULES entry (small reference card always-on)
+// SCHEMA RULES entry — REMOVED (v5.0.1)
+// The VIR_CONTRACT is already injected via setExtensionPrompt as a system
+// prompt, so a separate lorebook entry was redundant and caused the AI to
+// double-emit vir_delta.  ensureSchemaEntry now CLEANS UP any leftover entry.
 // ============================================================================
-function schemaContent() {
-    return `<ff4_vir_lorebook_rules>
-SOURCE OF TRUTH: lorebook [ACTIVE VIR] / [LOCKED VISUAL CARD] / [FF4_STATE] / [VIR_ROSTER] entries for THIS chat only.
-COPY locked-card lines VERBATIM into every <pic>. Never paraphrase. Never resize.
-NEW CHAR: emit new_characters in vir_sync with full locked fields.
-LOCKED CHANGE: emit vir_delta with ONLY changed fields.
-MUTABLE STATE: emit scene_state.characters[name] only — never vir_delta.
-RECALL: char absent 10+ turns → emit recall_characters:["Name"].
-DIALOGUE COLOR: wrap each char's spoken lines in <font color='HEX'>"..."</font> using their VIR.voice_lock.dialogue_color (see [FF4_STATE].dialogue_colors map).
-</ff4_vir_lorebook_rules>`;
-}
 function ensureSchemaEntry(data) {
     const entries = getEntries(data);
-    let entry = Object.values(entries).find(e => e?.comment === 'FF4 VIR Rules');
-    if (!entry) {
-        const uid = nextUid(data);
-        entry = makeEntry({ uid, key: ['VIR Rules'], comment: 'FF4 VIR Rules', content: schemaContent(), constant: true, order: 40, depth: 1, position: 0 });
-        entries[uid] = entry;
-    } else {
-        entry.content = schemaContent();
+    const entry = Object.values(entries).find(e => e?.comment === 'FF4 VIR Rules');
+    if (entry) {
+        delete entries[entry.uid];
+        log('Removed obsolete FF4 VIR Rules lorebook entry');
     }
-    return entry;
 }
 
 // ============================================================================
@@ -969,14 +880,61 @@ function stripVirKeyFragments(text) {
 }
 function stripVirFromMessage(text, processedRaw) {
     let updated = text || '';
+    // 1. Exact removal: delete the exact raw blocks we successfully parsed
     for (const raw of processedRaw || []) {
         if (updated.includes(raw)) updated = updated.replace(raw, '');
     }
+    // 2. Closed fence removal: delete fully closed ```vir fences
     updated = updated.replace(/```vir\b[\s\S]*?```/gi, '');
-    updated = updated.replace(/```vir\b[\s\S]*$/i, '');
+    
+    // NOTE: Removed the greedy unclosed fence regex (/```vir\b[\s\S]*$/i) because it 
+    // inadvertently deletes the <pic> tags placed by st-image-auto-generation.
+    
+    // 3. Fallback: Orphan block removal
     updated = stripOrphanSyncBlocks(updated);
     updated = stripVirKeyFragments(updated);
     return updated.replace(/\n{3,}/g, '\n\n').trim();
+}
+
+/**
+ * DOM-only strip: remove rendered ```vir code fences, orphan VIR JSON,
+ * and bare VIR JSON from the DOM element without touching msg.mes.
+ * Matches RPG HUD's stripHudFromDom() approach — safe for async image injection.
+ */
+const VIR_JSON_SIGNATURE = /"\s*schema\s*"\s*:\s*[123]\s*,\s*"\s*(?:characters|scene|states|new_characters|vir_delta|scene_state)/;
+function stripVirFromDom(el) {
+    if (!el) return;
+    // 1. ST renders ```vir as <pre><code class="language-vir">. Remove those.
+    el.querySelectorAll('pre:has(code.language-vir), code.language-vir').forEach(node => {
+        const pre = node.closest('pre') || node;
+        pre.remove();
+    });
+    // 2. Also catch VIR JSON in ANY <pre><code> block (AI may omit the vir language tag).
+    //    Check text content for the VIR JSON signature.
+    el.querySelectorAll('pre > code, pre').forEach(node => {
+        const text = node.textContent || '';
+        if (VIR_JSON_SIGNATURE.test(text)) {
+            const pre = node.closest('pre') || node;
+            pre.remove();
+        }
+    });
+    // 3. Remove <vir_sync> XML tags if rendered
+    if (/<vir_sync/i.test(el.innerHTML)) {
+        el.innerHTML = el.innerHTML.replace(/<vir_sync\b[^>]*>[\s\S]*?<\/vir_sync>/gi, '');
+    }
+    // 4. Remove bare VIR JSON text that isn't inside a code block.
+    //    Walk text nodes, find ones matching VIR JSON signature, remove them.
+    if (VIR_JSON_SIGNATURE.test(el.textContent || '')) {
+        const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null);
+        const toRemove = [];
+        let node;
+        while ((node = walker.nextNode())) {
+            if (VIR_JSON_SIGNATURE.test(node.textContent || '')) {
+                toRemove.push(node);
+            }
+        }
+        for (const n of toRemove) n.parentNode?.removeChild(n);
+    }
 }
 
 // ============================================================================
@@ -987,6 +945,8 @@ async function ensureWorldLoaded(worldName) {
     if (!data || typeof data !== 'object') data = { entries: {} };
     getEntries(data);
     ensureSchemaEntry(data);
+    ensureFF4StateEntry(data);      // cleanup obsolete lorebook entry
+    cleanupSceneStateEntry(data);   // migrate + cleanup obsolete lorebook entry
     await saveWorldInfo(worldName, data, true);
     await updateWorldInfoList();
     return data;
@@ -1071,62 +1031,28 @@ async function buildVirStateText() {
     try { data = await loadWorldInfo(worldName); } catch { return ''; }
     if (!data) return '';
 
+    const allChars = characterEntries(data);
+    if (!allChars.length) return '';
+
     const lines = ['=== VIR WORLD STATE ==='];
 
-    // Scene
-    const sceneEntry = Object.values(getEntries(data)).find(e => e?.comment === 'FF4 SCENE_STATE');
-    const scene = parseSceneState(sceneEntry);
-    if (scene.location || scene.time || scene.weather) {
-        const bits = [];
-        if (scene.location) bits.push(`location: ${scene.location}`);
-        if (scene.time) bits.push(`time: ${scene.time}`);
-        if (scene.weather) bits.push(`weather: ${scene.weather}`);
-        lines.push(`[SCENE] ${bits.join(' | ')}`);
-    }
-
-    const active = Array.isArray(scene.active_characters) ? scene.active_characters : [];
-    const sceneChars = scene.characters || {};
-
-    // Active character cards (compact one-block per char)
-    if (active.length) {
-        lines.push(`[ACTIVE CHARACTERS: ${active.join(', ')}]`);
-        for (const name of active) {
-            const entry = findCharacterEntry(data, name);
-            if (!entry) continue;
-            const vir = parseActiveVir(entry.content || '');
-            const card = [
-                `  ${name}:`,
-                vir.species ? `    species: ${vir.species}` : '',
-                vir.hair ? `    hair: ${vir.hair}` : '',
-                vir.eyes ? `    eyes: ${vir.eyes}` : '',
-                vir.skin_fur_scales ? `    skin: ${vir.skin_fur_scales}` : '',
-                vir.body ? `    body: ${vir.body}` : '',
-                vir.marks ? `    marks: ${vir.marks}` : '',
-                Array.isArray(vir.outfit) && vir.outfit.length ? `    outfit: ${vir.outfit.join('; ')}` : '',
-                vir.voice_lock?.dialogue_color ? `    dialogue_color: ${vir.voice_lock.dialogue_color}` : '',
-            ].filter(Boolean);
-            lines.push(...card);
-            // Mutable state for this char
-            const s = sceneChars[name];
-            if (s) {
-                const stateBits = [];
-                if (s.outfit_state) stateBits.push(`outfit:${s.outfit_state}`);
-                if (s.hair_state) stateBits.push(`hair:${s.hair_state}`);
-                if (s.body_fluids) stateBits.push(`fluids:${s.body_fluids}`);
-                if (s.injuries) stateBits.push(`injuries:${s.injuries}`);
-                if (s.aftermath) stateBits.push(`aftermath:${s.aftermath}t`);
-                if (s.position) stateBits.push(`pos:${s.position}`);
-                if (stateBits.length) lines.push(`    state: ${stateBits.join(' | ')}`);
-            }
-        }
-    }
-
-    // Offscreen roster (compact reference)
-    const allChars = characterEntries(data);
-    const offscreen = allChars.map(([, e]) => characterEntryName(e)).filter(n => n && !active.includes(n));
-    if (offscreen.length) {
-        lines.push(`[KNOWN OFFSCREEN] ${offscreen.join(', ')}`);
-        lines.push('  (emit recall_characters:["Name"] in vir packet to reactivate)');
+    // Character cards (compact one-block per char)
+    for (const [, entry] of allChars) {
+        const name = characterEntryName(entry);
+        if (!name) continue;
+        const vir = parseActiveVir(entry.content || '');
+        const card = [
+            `  ${name}:`,
+            vir.species ? `    species: ${vir.species}` : '',
+            vir.hair ? `    hair: ${vir.hair}` : '',
+            vir.eyes ? `    eyes: ${vir.eyes}` : '',
+            vir.skin_fur_scales ? `    skin: ${vir.skin_fur_scales}` : '',
+            vir.body ? `    body: ${vir.body}` : '',
+            vir.marks ? `    marks: ${vir.marks}` : '',
+            Array.isArray(vir.outfit) && vir.outfit.length ? `    outfit: ${vir.outfit.join('; ')}` : '',
+            vir.voice_lock?.dialogue_color ? `    dialogue_color: ${vir.voice_lock.dialogue_color}` : '',
+        ].filter(Boolean);
+        lines.push(...card);
     }
 
     // Recall window
@@ -1186,49 +1112,19 @@ async function processSyncPacket(sync) {
     saveSettingsDebounced();
     const recallActive = new Set(Object.keys(st.recallCharacters[worldName] || {}));
 
-    // ── Scene state merge (schema 3 flat OR schema 1/2 nested) ──
-    const existingSceneEntry = Object.values(getEntries(data)).find(e => e?.comment === 'FF4 SCENE_STATE');
-    const existingScene = parseSceneState(existingSceneEntry);
-    let mergedScene = { ...existingScene };
-
-    // Schema 3: flat `scene` object
-    if (sync.scene && typeof sync.scene === 'object') {
-        if (sync.scene.location !== undefined) mergedScene.location = sync.scene.location;
-        if (sync.scene.time !== undefined) mergedScene.time = sync.scene.time;
-        if (sync.scene.weather !== undefined) mergedScene.weather = sync.scene.weather;
-        if (sync.scene.active !== undefined) {
-            mergedScene.active_characters = typeof sync.scene.active === 'string'
-                ? sync.scene.active.split(/\s*,\s*/).filter(Boolean)
-                : sync.scene.active;
-        }
+    // ── Extract active character names from packet (no state storage) ──
+    const packetActiveNames = new Set();
+    // Schema 3: scene.active
+    if (sync.scene?.active) {
+        const actives = typeof sync.scene.active === 'string'
+            ? sync.scene.active.split(/\s*,\s*/).filter(Boolean)
+            : Array.isArray(sync.scene.active) ? sync.scene.active : [];
+        for (const name of actives) packetActiveNames.add(name);
     }
-    // Schema 1/2 backward compat
-    if (sync.scene_state) {
-        mergedScene = mergeSceneState(mergedScene, sync.scene_state);
-    }
-
-    // ── Per-char mutable state (schema 3 `states[]` OR schema 1/2 `char_state` object) ──
-    mergedScene.characters = mergedScene.characters || {};
-    if (Array.isArray(sync.states)) {
-        for (const s of sync.states) {
-            if (!s || !s.name) continue;
-            const name = canonicalizeName(s.name).canonical;
-            const charState = { ...(mergedScene.characters[name] || {}) };
-            if (s.outfit_state !== undefined) charState.outfit_state = s.outfit_state;
-            if (s.hair_state !== undefined) charState.hair_state = s.hair_state;
-            if (s.body_fluids !== undefined) charState.body_fluids = s.body_fluids;
-            if (s.injuries !== undefined) charState.injuries = s.injuries;
-            if (s.position !== undefined) charState.position = s.position;
-            if (s.aftermath !== undefined) charState.aftermath = s.aftermath;
-            mergedScene.characters[name] = charState;
-        }
-    }
-    if (sync.char_state && typeof sync.char_state === 'object') {
-        for (const [name, s] of Object.entries(sync.char_state)) {
-            mergedScene.characters[name] = { ...(mergedScene.characters[name] || {}), ...s };
-        }
-    }
-    ensureSceneStateEntry(data, mergedScene);
+    // Schema 1/2: scene_state.active_characters
+    for (const name of sync.scene_state?.active_characters || []) packetActiveNames.add(name);
+    // Cleanup any leftover state lorebook entries
+    cleanupSceneStateEntry(data);
 
     // ── Characters: schema 3 (`characters[]` array) ──
     if (Array.isArray(sync.characters)) {
@@ -1256,8 +1152,8 @@ async function processSyncPacket(sync) {
         if (e) upserted.push(characterEntryName(e));
     }
 
-    // Active char names: from scene.active + new chars + recall
-    const activeNames = new Set(mergedScene.active_characters || []);
+    // Active char names: from packet scene.active + new chars + recall
+    const activeNames = new Set(packetActiveNames);
     if (Array.isArray(sync.characters)) {
         for (const char of sync.characters) {
             if (char?.name && char.action !== 'update') activeNames.add(canonicalizeName(char.name).canonical);
@@ -1285,26 +1181,27 @@ async function processSyncPacket(sync) {
 }
 
 // ============================================================================
-// PROCESS MESSAGE — parse + strip
+// PROCESS MESSAGE — parse VIR packets only (NO strip — that happens in GENERATION_ENDED)
 // ============================================================================
-async function processMessage(messageId) {
+async function processMessageData(messageId) {
     const context = getContext();
     const message = context.chat?.[messageId];
-    if (!message || message.is_user) return;
+    if (!message || message.is_user) return [];
     const text = message.mes || '';
     // Skip if no possible VIR content
     if (!text.includes('```vir') && !text.includes('<vir_sync') && !text.includes('"schema"')
         && !text.includes('"characters"') && !text.includes('"vir_delta"')
         && !text.includes('"scene_state"') && !text.includes('"new_characters"')
-        && !text.includes('"scene"') && !text.includes('"states"')) return;
+        && !text.includes('"scene"') && !text.includes('"states"')) return [];
 
     const packets = extractPackets(text);
     message.extra = message.extra || {};
     message.extra[EXT] = message.extra[EXT] || {};
     const processedHashes = new Set(message.extra[EXT].processed || []);
 
-    const processedRaw = [];
     const upsertedAll = new Set();
+    const processedRaw = [];
+    let newPackets = 0;
 
     try {
         for (const packet of packets) {
@@ -1313,58 +1210,98 @@ async function processMessage(messageId) {
             let sync;
             try { sync = parsePacket(packet); }
             catch (e) {
-                // Parse failed even after 4-pass repair. Log + mark as processed +
-                // still strip from chat. Match RPG HUD's behavior: one parse, log
-                // failure if it can't recover, move on.
                 noteSyncStatus(`Packet parse failed: ${e.message}`, [`parse failed: ${e.message}`], true);
                 processedHashes.add(rawHash); processedHashes.add(packet.sig);
-                processedRaw.push(packet.raw);
+                processedRaw.push(packet.raw); // Collect raw even on fail for stripping
                 continue;
             }
             const result = await processSyncPacket(sync);
             (result.upserted || []).forEach(n => upsertedAll.add(n));
-            processedRaw.push(packet.raw);
             processedHashes.add(rawHash); processedHashes.add(packet.sig);
+            processedRaw.push(packet.raw); // Collect raw for surgical stripping
             sessionPacketCount++;
+            newPackets++;
         }
         message.extra[EXT].processed = [...processedHashes];
 
-        // Auto-strip — runs even if no packets parsed (catches malformed leftovers).
-        // IMPORTANT: do NOT call updateMessageBlock here. MESSAGE_RECEIVED fires
-        // before the message is rendered to DOM; modifying message.mes in-place
-        // is enough — the renderer picks up the cleaned text. Calling
-        // updateMessageBlock re-renders the DOM and invalidates the message-block
-        // reference that st-image-auto-generation captured for image injection,
-        // causing images returned by ComfyUI to never appear in chat.
-        if (settings().autoHideSyncedPackets) {
-            const cleaned = stripVirFromMessage(text, processedRaw);
-            if (cleaned !== text) {
-                message.mes = cleaned;
-            }
-        }
-        // NOTE: do NOT saveChat here. st-image-auto-generation runs ComfyUI
-        // asynchronously (seconds-to-minutes after MESSAGE_RECEIVED) and saves
-        // chat itself once the image markdown is spliced into message.mes.
-        // Saving here would persist a pre-image snapshot; if the user reloads
-        // before the image arrives there'd still be no problem, but if we save
-        // multiple times in quick succession there's a real risk of a stale
-        // write racing the image extension's save. ST auto-saves on the next
-        // message anyway — leave it to the natural cadence.
-
-        if (processedRaw.length || upsertedAll.size) {
+        if (newPackets || upsertedAll.size) {
             const upNote = upsertedAll.size ? ` (${[...upsertedAll].join(', ')})` : '';
             settings().sessionPacketCount = sessionPacketCount;
-            noteSyncStatus(`Synced ${processedRaw.length} VIR packet(s)${upNote}`);
+            noteSyncStatus(`Synced ${newPackets} VIR packet(s)${upNote}`);
         }
+        return processedRaw;
     } catch (e) {
-        error('processMessage failed', e);
+        error('processMessageData failed', e);
         noteSyncStatus(`VIR sync failed: ${e.message}`, [`failed: ${e.message}`], true);
+        return processedRaw;
     }
 }
-async function handleMessage(messageId) {
+
+/**
+ * GENERATION_ENDED handler — matches RPG HUD's pattern:
+ * Find the last AI message, parse VIR data from it, strip msg.mes, save chat.
+ * This fires ONCE after the full AI response, so it's safe to modify msg.mes
+ * and saveChat() here — ComfyUI image injection happens separately.
+ */
+async function handleGenerationEnded() {
     if (!settings().enabled) return;
-    processingQueue = processingQueue.then(() => processMessage(messageId)).catch(e => error('queue', e));
-    processingQueue = processingQueue.then(() => decayRecall()).catch(e => error('decay', e));
+    const context = getContext();
+    if (!context.chat?.length) return;
+    for (let i = context.chat.length - 1; i >= 0; i--) {
+        const msg = context.chat[i];
+        if (!msg || msg.is_user || msg.is_system) continue;
+
+        // Parse VIR data
+        let processedRaw = [];
+        try { processedRaw = await processMessageData(i) || []; } catch (e) { error('handleGenerationEnded parse:', e); }
+
+        // Fetch fresh mes! Another extension (like st-image-auto-generation) might
+        // have modified msg.mes during the await above. Using a stale string here
+        // would overwrite and erase their changes.
+        const currentMes = msg.mes || '';
+
+        // Strip VIR blocks from msg.mes
+        if (settings().autoHideSyncedPackets) {
+            const cleaned = stripVirFromMessage(currentMes, processedRaw);
+            if (cleaned !== currentMes) {
+                msg.mes = cleaned;
+                try { context.saveChat(); } catch (e) { warn('saveChat failed:', e); }
+                // Also strip from DOM if already rendered
+                const domEl = document.querySelector(`.mes[mesid="${i}"] .mes_text`);
+                if (domEl) stripVirFromDom(domEl);
+            }
+        }
+
+        // Decay recall counters
+        try { await decayRecall(); } catch (e) { error('recall decay:', e); }
+        break;
+    }
+}
+
+/**
+ * MESSAGE_RECEIVED handler — DOM-only strip (matches RPG HUD).
+ * Never touches msg.mes — that's handled by GENERATION_ENDED.
+ */
+function handleMessageReceived(mesId) {
+    if (!settings().enabled) return;
+    const context = getContext();
+    const idx = typeof mesId === 'number' ? mesId : context.chat.length - 1;
+    const msg = context.chat?.[idx];
+    if (!msg || msg.is_user) return;
+    const el = document.querySelector(`.mes[mesid="${idx}"] .mes_text`);
+    if (el) stripVirFromDom(el);
+}
+
+/**
+ * CHARACTER_MESSAGE_RENDERED handler — DOM-only strip after render.
+ * Catches any VIR fences that survived into rendered HTML.
+ */
+function handleMessageRendered(mesId) {
+    if (!settings().enabled) return;
+    const context = getContext();
+    const idx = typeof mesId === 'number' ? mesId : context.chat.length - 1;
+    const el = document.querySelector(`.mes[mesid="${idx}"] .mes_text`);
+    if (el) stripVirFromDom(el);
 }
 
 // ============================================================================
@@ -1509,10 +1446,9 @@ async function reapplyTiers() {
     const st = settings();
     const pinned = new Set(st.pinnedCharacters?.[worldName] || []);
     const recall = new Set(Object.keys(st.recallCharacters?.[worldName] || {}));
-    const sceneEntry = Object.values(getEntries(data)).find(e => e?.comment === 'FF4 SCENE_STATE');
-    const scene = parseSceneState(sceneEntry);
-    const active = new Set(scene.active_characters || []);
-    setActiveFlags(data, active, pinned, recall);
+    // No stored scene state — active set is empty; tiers set during last sync remain.
+    // Pinned/recall overrides are still applied.
+    setActiveFlags(data, new Set(), pinned, recall);
     ensureFF4StateEntry(data);
     rebuildRosterEntry(data);
     await saveWorldInfo(worldName, data, true);
@@ -1780,10 +1716,21 @@ jQuery(async () => {
     });
     eventSource.on(event_types.CHAT_DELETED, cleanupVirForDeletedChat);
     eventSource.on(event_types.GROUP_CHAT_DELETED, cleanupVirForDeletedChat);
-    // Single hook only — both events fire per message; using only MESSAGE_RECEIVED
-    // prevents double-processing and the resulting duplicate parse-failure warnings.
-    eventSource.on(event_types.MESSAGE_RECEIVED, handleMessage);
+
+    // ── GENERATION_ENDED — parse VIR data + strip msg.mes (RPG HUD pattern) ──
+    // This fires once after the full AI response. Safe to modify msg.mes and
+    // saveChat() here without racing ComfyUI's async image injection.
+    eventSource.on(event_types.GENERATION_ENDED, handleGenerationEnded);
+
+    // ── MESSAGE_RECEIVED — DOM-only strip (never touch msg.mes) ──
+    // Removes rendered ```vir fences from the visible DOM during streaming.
+    eventSource.on(event_types.MESSAGE_RECEIVED, handleMessageReceived);
+
+    // ── CHARACTER_MESSAGE_RENDERED — DOM-only strip after full render ──
+    // Catches any VIR content that survived into the final rendered HTML.
+    eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, handleMessageRendered);
+
     registerSlashCommands();
     await activateCurrentWorld();
-    log(`v${VERSION} initialized (clean rebuild)`);
+    log(`v${VERSION} initialized (RPG-HUD-aligned event model)`);
 });
