@@ -11,7 +11,6 @@ import {
     getCurrentChatId,
     saveMetadata,
     saveSettingsDebounced,
-    updateMessageBlock,
 } from '../../../../script.js';
 import {
     METADATA_KEY as WI_METADATA_KEY,
@@ -1316,12 +1315,17 @@ async function processMessage(messageId) {
         }
         message.extra[EXT].processed = [...processedHashes];
 
-        // Auto-strip — runs even if no packets parsed (catches malformed leftovers)
+        // Auto-strip — runs even if no packets parsed (catches malformed leftovers).
+        // IMPORTANT: do NOT call updateMessageBlock here. MESSAGE_RECEIVED fires
+        // before the message is rendered to DOM; modifying message.mes in-place
+        // is enough — the renderer picks up the cleaned text. Calling
+        // updateMessageBlock re-renders the DOM and invalidates the message-block
+        // reference that st-image-auto-generation captured for image injection,
+        // causing images returned by ComfyUI to never appear in chat.
         if (settings().autoHideSyncedPackets) {
             const cleaned = stripVirFromMessage(text, processedRaw);
             if (cleaned !== text) {
                 message.mes = cleaned;
-                updateMessageBlock(messageId, message);
             }
         }
         try { await context.saveChat(); } catch { /* ignore */ }
