@@ -1,95 +1,153 @@
-#ff4_vir_lorebook_sync_settings .ff4-vir-help {
-    opacity: 0.78;
-    font-size: 0.9em;
-    margin: 4px 0 10px;
-    line-height: 1.35;
+/* FF4 VIR Lorebook Sync v5.0 — compact panel */
+
+#ff4_vir_settings .ff4-vir-subtitle {
+    opacity: 0.55;
+    font-size: 0.78em;
+    margin: 0 0 10px;
+    letter-spacing: 0.02em;
 }
 
-#ff4_vir_lorebook_sync_settings .ff4-vir-row {
+#ff4_vir_settings .ff4-vir-tog {
     display: flex;
     align-items: center;
-    justify-content: space-between;
-    gap: 10px;
-    margin: 8px 0;
+    gap: 8px;
+    padding: 5px 6px;
+    margin: 2px 0;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.92em;
+    user-select: none;
 }
 
-#ff4_vir_lorebook_sync_settings .ff4-vir-status {
-    padding: 8px;
+#ff4_vir_settings .ff4-vir-tog:hover {
+    background: var(--black30a, rgba(0,0,0,0.2));
+}
+
+#ff4_vir_settings .ff4-vir-tog input[type="checkbox"] {
+    flex: 0 0 auto;
+    margin: 0;
+}
+
+#ff4_vir_settings .ff4-vir-tog span {
+    flex: 1;
+}
+
+#ff4_vir_settings details.ff4-vir-advanced,
+#ff4_vir_settings details.ff4-vir-chars,
+#ff4_vir_settings details.ff4-vir-warnings {
+    margin-top: 10px;
     border: 1px solid var(--SmartThemeBorderColor);
     border-radius: 6px;
     background: var(--SmartThemeBlurTintColor);
-    word-break: break-word;
-    line-height: 1.45;
+    padding: 6px 8px;
 }
 
-#ff4_vir_lorebook_sync_settings .ff4-vir-audit {
-    padding: 8px;
-    margin-top: 8px;
+#ff4_vir_settings details > summary {
+    cursor: pointer;
+    user-select: none;
+    font-weight: 600;
+    font-size: 0.92em;
+    padding: 2px 0;
+    list-style: none;
+}
+
+#ff4_vir_settings details > summary::-webkit-details-marker { display: none; }
+#ff4_vir_settings details > summary::before {
+    content: '▸';
+    display: inline-block;
+    width: 14px;
+    transition: transform 0.15s;
+    opacity: 0.6;
+}
+#ff4_vir_settings details[open] > summary::before {
+    transform: rotate(90deg);
+}
+
+#ff4_vir_settings .ff4-vir-status {
+    margin-top: 10px;
+    padding: 8px 10px;
     border: 1px solid var(--SmartThemeBorderColor);
     border-radius: 6px;
-    background: var(--black30a);
-    line-height: 1.35;
+    background: var(--SmartThemeBlurTintColor);
+    font-size: 0.86em;
+    line-height: 1.5;
 }
 
-#ff4_vir_lorebook_sync_settings .ff4-vir-warning {
-    margin-top: 5px;
+#ff4_vir_settings .ff4-vir-status b {
+    opacity: 0.7;
+    font-weight: 600;
+    margin-right: 4px;
+}
+
+#ff4_vir_settings .ff4-vir-tier-legend {
+    font-size: 0.75em;
+    margin-left: 8px;
+    opacity: 0.5;
+    letter-spacing: 0.15em;
+}
+
+#ff4_vir_settings .ff4-vir-muted {
+    opacity: 0.6;
+}
+
+#ff4_vir_settings .ff4-vir-warning {
+    margin: 3px 0;
+    padding: 4px 6px;
     color: var(--warning, #d7a900);
     word-break: break-word;
+    font-size: 0.85em;
+    border-left: 2px solid var(--warning, #d7a900);
+    padding-left: 8px;
+    background: rgba(215, 169, 0, 0.05);
 }
 
-#ff4_vir_lorebook_sync_settings .ff4-vir-muted {
-    margin-top: 5px;
-    opacity: 0.7;
-}
-
-#ff4_vir_lorebook_sync_settings .ff4-vir-buttons {
+#ff4_vir_settings .ff4-vir-buttons {
     display: flex;
     flex-wrap: wrap;
-    gap: 8px;
+    gap: 6px;
     margin-top: 10px;
 }
 
-#ff4_vir_lorebook_sync_settings .ff4-vir-section {
-    padding: 8px;
-    margin-top: 8px;
-    border: 1px solid var(--SmartThemeBorderColor);
-    border-radius: 6px;
-    background: var(--SmartThemeBlurTintColor);
+#ff4_vir_settings .ff4-vir-buttons .menu_button {
+    font-size: 0.86em;
+    padding: 4px 10px;
+    min-width: 0;
 }
 
-#ff4_vir_lorebook_sync_settings .ff4-vir-section > b {
-    display: block;
-    margin-bottom: 4px;
-}
-
-#ff4_vir_lorebook_sync_settings .ff4-vir-char-list {
+#ff4_vir_settings .ff4-vir-char-list {
     max-height: 220px;
     overflow-y: auto;
-    margin: 6px 0;
+    margin: 6px 0 4px;
 }
 
-#ff4_vir_lorebook_sync_settings .ff4-vir-char-row {
+#ff4_vir_settings .ff4-vir-char-row {
     display: flex;
     align-items: center;
     gap: 8px;
-    padding: 4px 2px;
+    padding: 3px 2px;
     border-bottom: 1px solid var(--black20a);
+    font-size: 0.88em;
 }
 
-#ff4_vir_lorebook_sync_settings .ff4-vir-char-tier {
-    font-size: 0.8em;
-    min-width: 80px;
-    opacity: 0.85;
+#ff4_vir_settings .ff4-vir-char-row:last-child {
+    border-bottom: 0;
 }
 
-#ff4_vir_lorebook_sync_settings .ff4-vir-char-name {
+#ff4_vir_settings .ff4-vir-char-tier {
+    font-size: 0.75em;
+    min-width: 56px;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+}
+
+#ff4_vir_settings .ff4-vir-char-name {
     flex: 1;
     word-break: break-word;
     font-weight: 500;
 }
 
-#ff4_vir_lorebook_sync_settings .ff4-vir-pin-btn {
-    font-size: 0.8em;
+#ff4_vir_settings .ff4-vir-pin-btn {
+    font-size: 0.75em;
     padding: 2px 8px;
-    min-width: 50px;
+    min-width: 48px;
 }

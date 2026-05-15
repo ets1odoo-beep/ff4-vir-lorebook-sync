@@ -1,6 +1,7 @@
-// FF4 VIR Lorebook Sync — v2 (rebuild 2026-05-14)
-// Single-file extension. Preserves existing lorebook storage format so old
-// "FF4 VIR -" worlds are picked up and resynced on top.
+// FF4 VIR Lorebook Sync — v5.0.0 (clean rebuild, RPG-HUD-style architecture)
+// Auto-injects the VIR contract; AI emits ```vir code-fence blocks; extension
+// parses, updates lorebook entries dynamically (smart tier system), strips
+// JSON from visible chat. No preset edit required.
 
 import { extension_settings, getContext } from '../../../extensions.js';
 import {
@@ -8,7 +9,6 @@ import {
     eventSource,
     event_types,
     getCurrentChatId,
-    getRequestHeaders,
     saveMetadata,
     saveSettingsDebounced,
     updateMessageBlock,
@@ -19,396 +19,294 @@ import {
     deleteWorldInfo,
     loadWorldInfo,
     saveWorldInfo,
+    selected_world_info,
     updateWorldInfoList,
     updateWorldInfoSettings,
     world_names,
 } from '../../../world-info.js';
 
-// ------------------------------------------------------------------
-// Constants
-// ------------------------------------------------------------------
+// ============================================================================
+// CONSTANTS
+// ============================================================================
 const EXT = 'ff4-vir-lorebook-sync';
-const VERSION = '4.0.0';
-
-// Peak v4 plan: regex-able watchdogs, FF4_STATE builder, CHAR_STATE machine, schema v2
-const BANNED_VOCABULARY_DEFAULT = [
-    'fresh meat', 'breath hitching', 'breath catching', 'husky', 'throaty', 'gravelly',
-    'catching in throat', 'ozone', 'shivers down spine', 'pupils dilated', 'pupils blown wide',
-    'nails biting', 'velvet', 'vise', 'vice', 'structural integrity', 'deep curve',
-    'furnace', 'calloused', 'guttural', 'unadulterated', 'jaw clenched',
-    'barely above a whisper', 'musk', 'predatory',
-];
-const MACRO_EMOTION_RE = /\b(felt|knew|realized|understood|sensed)\s+(angry|sad|happy|scared|afraid|annoyed|frustrated|aroused|jealous|relieved|excited|nervous|guilty|ashamed|disappointed|surprised|content|lonely)\b/i;
-const DECLARED_ACTION_RE = /\b(?:i|me|my)\s+(?:walk|run|step|move|turn|look|glance|nod|shake|reach|grab|pull|push|open|close|sit|stand|kneel|lie|lay|lean|jump|kick|punch|hit|strike|draw|sheathe|wave|gesture|point|smile|grin|frown|laugh|cry|sob|scream|shout|whisper|murmur|say|ask|tell|reply|answer|speak|talk|kiss|hug|hold|touch|stroke|caress|undress|strip|put|place|set|take|give|hand|throw|catch|drop|pick|carry|lift|press|squeeze|pinch|bite|lick|suck|swallow|drink|eat)\b/i;
-const PIC_TAG_RE = /<pic\s+([^>]*?)>/gi;
-const PIC_PROMPT_RE = /prompt\s*=\s*['"]([^'"]*)['"]/i;
+const VERSION = '5.0.0';
 const WORLD_PREFIX = 'FF4 VIR - ';
-const OLD_WORLD_NAMES = new Set(['FF4 VIR Registry']);
-const SYNC_RE = /<vir_sync\b[^>]*>([\s\S]*?)<\/vir_sync>/gi;
-const SYNC_RE_ENCODED = /&lt;vir_sync\b[^&]*&gt;([\s\S]*?)&lt;\/vir_sync&gt;/gi;
-const REQUIRED_VIR_FIELDS = ['species', 'age_appearance', 'height', 'hair', 'eyes', 'skin_fur_scales', 'body', 'outfit'];
-const RECOMMENDED_VIR_FIELDS = ['face_features', 'brow_lash', 'lips_teeth', 'hands_feet', 'posture_voice'];
-const MUTABLE_STATE_PATTERN = /\b(currently|now|presently|still|previously|at the moment|right now|during sex|this scene|rolling back|stretched around|dripping wet|leaking cum|unbuttoned to|hanging open|discarded on|set aside|pushed (down|aside)|bunched at|exposed,|pushed up to)\b/i;
-const WEAK_TEXT_RE = /\b(unknown|unspecified|generic|default|usual|same as before|same outfit|normal clothes|school uniform|formal attire|casual clothes|everyday clothes|long hair|short hair|medium hair|dark hair|light hair|black eyes|blue eyes|brown eyes|red eyes|green eyes|big breasts|large breasts|huge breasts|large cock|huge cock|huge dick|small breasts|average body|fit build|curvy figure|nice body|pretty face)\b/i;
-const SCENARIO_NAME_SUFFIX_RE = /\s*(?:[-–—|:/\\()[\]{}]+|\b)(?:netori|ntr|netorare|roleplay|rp|scenario|story|plot|route|mode|au|alt|alternate|version|ver\.?|variant|outfit|costume|uniform|dress|casual|swimsuit|bikini|lingerie|school|college|office|maid|nurse|wife|mom|mother|aunt|sister|niece|girlfriend|isekai|rpg|vn)\b.*$/i;
-const NAME_NOISE_RE = /\b(netori|ntr|netorare|roleplay|scenario|route|au|alt|variant|outfit|costume|mode|rpg|vn)\b/i;
-const MAX_RECENT_WARNINGS = 12;
 
-// Lorebook entry positioning tiers
-// position: 0 = before char defs, 4 = at depth (most reliable for context-recent injection)
+// Tier system — re-applied every sync based on scene_state
+// Tier A: pinned mains (always inject)
+// Tier B: chars in scene_state.active_characters (constant=true)
+// Tier C: chars in recall window (constant=true for N turns)
+// Tier D: offscreen chars (constant=false, keyword-only — costs zero tokens until mentioned)
 const TIER = {
-    SCHEMA:    { order: 40, depth: 1, position: 0 }, // schema rules
-    PIC_RULES: { order: 42, depth: 1, position: 0 }, // pic-format rules (migrated from preset)
-    ROSTER:    { order: 44, depth: 1, position: 0 }, // one-line summary of all characters
-    SCENE:     { order: 45, depth: 1, position: 0 }, // scene index
-    PINNED:    { order: 60, depth: 1, position: 4 }, // Tier A: pinned mains
-    ACTIVE:    { order: 70, depth: 2, position: 4 }, // Tier B: scene-active or keep-all
-    RECALL:    { order: 72, depth: 2, position: 4 }, // recall-bumped for next N turns
-    OFFSCREEN: { order: 80, depth: 3, position: 0 }, // Tier C: keyword-triggered only
+    PINNED:    { order: 60, depth: 1 },
+    ACTIVE:    { order: 70, depth: 2 },
+    RECALL:    { order: 72, depth: 2 },
+    OFFSCREEN: { order: 80, depth: 3 },
 };
 
+// Dialogue color palette — light/bright colors only (dark-theme readable)
+// Stored inside each char's voice_lock.dialogue_color so AI sees it in VIR
+// context and references it consistently.
+const DIALOGUE_PALETTE = [
+    '#FF8A80', // coral red
+    '#FFAB91', // peach
+    '#FFCC80', // light orange
+    '#FFE082', // butter yellow
+    '#FFF59D', // pale yellow
+    '#A5D6A7', // mint green
+    '#80CBC4', // soft teal
+    '#80DEEA', // light cyan
+    '#81D4FA', // sky blue
+    '#90CAF9', // ice blue
+    '#B39DDB', // soft lavender
+    '#CE93D8', // light orchid
+    '#F48FB1', // rose pink
+    '#F8BBD0', // pale pink
+    '#E1BEE7', // pale violet
+    '#FFD180', // honey
+];
+
+// Regex patterns for packet detection
+const SYNC_RE_FENCE = /```vir\b\s*\n?([\s\S]*?)\n?```/gi;
+const SYNC_RE_XML = /<vir_sync\b[^>]*>([\s\S]*?)<\/vir_sync>/gi;
+const TAIL_SCAN_CHARS = 5000;
+
+// ============================================================================
+// DEFAULT SETTINGS
+// ============================================================================
 const defaultSettings = {
     enabled: true,
     debug: false,
     autoHideSyncedPackets: true,
-    cleanupOnChatDelete: true,
     bindToChat: true,
-    keepAllConstant: true,
-    usePicRules: false,          // inject FF4 Pic Format rules into lorebook (preset has them by default)
-    preGenUserScan: true,        // scan user input for char names → bump active
-    picTagVerify: 'rewrite',     // 'off' | 'warn' | 'inject' | 'rewrite' — surgical pic-tag fixer
-    recallTurnsDefault: 5,       // default recall duration
-    // Peak v3 plan additions (v4.0)
-    schemaVersion: 2,            // sync packet schema version emitted
-    aftermathWindowDefault: 3,   // turns aftermath state persists per char
-    charStateDecayTurns: 8,      // turns before mutable items revert to neutral
-    driftPolicy: 'rewrite',      // 'off' | 'warn' | 'inject' | 'rewrite' — pic drift watchdog
-    bannedVocabPolicy: 'inject', // 'off' | 'warn' | 'inject' — banned vocabulary watchdog
-    bannedVocabulary: BANNED_VOCABULARY_DEFAULT.slice(),
-    repetitionAuditEnabled: true,
-    shapeVarianceEnabled: true,
-    antiEchoEnabled: true,
-    macroEmotionPolicy: 'warn',  // 'off' | 'warn' | 'inject'
-    femaleAcousticsGuard: true,
-    sceneSeparationEnabled: true,
-    agencyMode: 'auto',          // 'reactive' | 'guided' | 'auto'
-    somaticLockAutoDetect: true,
-    challengeMode: false,
-    cynicismAperture: false,
-    pov: 'narrator',             // 'narrator' | 'omniscient' | 'second' | 'first-direct' | 'first-character' | 'hybrid'
-    tense: 'present',            // 'present' | 'past'
-    nsfwLexiconAutoTrigger: true,
-    powerDynamicsAutoTrigger: true,
-    multiPartnerAutoTrigger: true,
-    edgingAutoTrigger: true,
-    aftermathAutoTrigger: true,
-    backgroundLifeEnabled: false,
-    backgroundLifeDensity: 10,   // every N turns
-    offScreenEventsEnabled: false,
-    offScreenEventsDensity: 12,
-    worldClockEnabled: true,
-    autoBootstrapEnabled: true,
-    crossChatVoiceLockSync: false,
-    compactionMode: 'full',      // 'full' | 'reduced' | 'aggressive'
+    cleanupOnChatDelete: true,
+    smartTiers: true,                // recommended: dynamic constant flag per scene
+    contractInjection: true,         // auto-inject VIR contract via setExtensionPrompt
+    recallTurnsDefault: 8,           // longer than v4 for better long-term memory
     worldChatMap: {},
     pinnedCharacters: {},
     recallCharacters: {},
-    keyExpansions: {},
-    // Telemetry / audit state per-world
-    shapeHistory: {},            // { worldName: ['dialogue','action','dense'] }
-    phraseHashes: {},            // { worldName: { turnN: [hashes] } }
-    bannedVocabHits: {},         // { worldName: [{turn, term, char}] }
-    driftWarnings: {},           // { worldName: [{turn, char, missing[]}] }
-    sceneIds: {},                // { worldName: { currentId: 'kitchen-27', byTurn: {n:id} } }
-    voiceLocks: {},              // { cardAvatarKey: { ...voice_lock } } — cross-chat cache when enabled
     lastSyncStatus: 'No sync yet',
     lastSyncAt: 0,
-    recentWarnings: [],
     sessionPacketCount: 0,
-    lastError: '',
+    recentWarnings: [],
 };
-
+const MAX_RECENT_WARNINGS = 10;
 let processingQueue = Promise.resolve();
 let sessionPacketCount = 0;
 
-// ------------------------------------------------------------------
-// Settings + helpers
-// ------------------------------------------------------------------
+// ============================================================================
+// THE VIR CONTRACT — auto-injected as system prompt every generation
+// ============================================================================
+const VIR_CONTRACT = `<vir_contract>
+# VIR CONTRACT — auto-injected by FF4 VIR Lorebook Sync extension
+
+You run a Visual Identity Registry (VIR) state engine in parallel with the roleplay. The extension reads your \`vir\` code-fence block to track characters, scene state, and mutable conditions.
+
+## RULE 1 — OUTPUT FORMAT (NON-NEGOTIABLE)
+
+Every response MUST end with exactly ONE markdown code fence labeled \`vir\`:
+
+\`\`\`vir
+{...FLAT JSON HERE...}
+\`\`\`
+
+- Place at the ABSOLUTE END — after all prose, after \`<pic>\` tags, after Plot Momentum / RPG HUD / any other macro.
+- Single line of valid JSON. No comments. No trailing commas. ASCII quotes only.
+- The JSON is INTENTIONALLY FLAT — no deeply nested objects, no objects-keyed-by-name. Arrays of flat objects only.
+
+## RULE 2 — FLAT SCHEMA (matches RPG HUD's pattern for maximum parse reliability)
+
+\`\`\`vir
+{"schema":3,"characters":[{"name":"...","action":"create|update","species":"...","source":"...","age":"...","height":"...","hair":"...","eyes":"...","face":"...","brows":"...","lips":"...","skin":"...","body":"...","hands":"...","voice":"...","marks":"...","non_human":"...","outfit":"...","underwear":"...","accessories":"...","equipment":"...","voice_gender":"...","voice_vocab":"...","voice_profanity":"...","voice_signature":"...","voice_color":"#HEX"}],"scene":{"location":"...","time":"...","weather":"...","active":"Name1,Name2"},"states":[{"name":"...","outfit_state":"...","hair_state":"...","body_fluids":"...","injuries":"...","position":"...","aftermath":0}],"recall":["Name1","Name2"]}
+\`\`\`
+
+## RULE 3 — TOP-LEVEL KEYS (only 4)
+
+- \`characters\`: ARRAY of flat char objects. Each has \`name\` (required) + \`action\`:"create" for new chars OR "update" for permanent appearance changes (haircut, dye, scar). On "update", emit ONLY changed fields.
+- \`scene\`: ONE flat object — location, time, weather, active (comma-separated names of currently visible chars).
+- \`states\`: ARRAY of flat per-char mutable state objects. Each has \`name\` (required) + outfit_state / hair_state / body_fluids / injuries / position / aftermath (number).
+- \`recall\`: ARRAY of name strings — forcibly re-activate offscreen chars (use when char has been absent 10+ turns).
+
+## RULE 4 — FLAT FIELD CONVENTIONS (CRITICAL — no nesting allowed)
+
+- Multi-piece outfit/accessories/equipment/underwear: SEMICOLON-separated STRING, NOT array.
+  CORRECT: \`"outfit":"beige cotton tunic; brown leather belt; brown sandals"\`
+  WRONG:   \`"outfit":["beige cotton tunic","brown leather belt"]\`  (array — banned)
+
+- Voice info as FLAT \`voice_*\` fields, NOT a nested voice_lock object.
+  CORRECT: \`"voice_gender":"female","voice_vocab":"casual","voice_color":"#FFCC80"\`
+  WRONG:   \`"voice_lock":{"gender":"female","vocab_tier":"casual"}\`  (nested — banned)
+
+- Signature phrases as semicolon-separated string.
+  CORRECT: \`"voice_signature":"um; oh!; eh?"\`
+  WRONG:   \`"voice_signature":["um","oh!","eh?"]\`  (array — banned)
+
+- Active characters as comma-separated string.
+  CORRECT: \`"active":"Belne,Mara,ETS"\`
+  WRONG:   \`"active":["Belne","Mara","ETS"]\`  (array — banned)
+
+## RULE 5 — VOICE COLOR
+
+\`voice_color\` is a HEX code for character dialogue. Use LIGHT/BRIGHT colors readable on dark themes:
+#FF8A80 #FFAB91 #FFCC80 #FFE082 #FFF59D #A5D6A7 #80CBC4 #80DEEA #81D4FA #90CAF9 #B39DDB #CE93D8 #F48FB1 #F8BBD0 #E1BEE7 #FFD180
+
+Wrap each char's spoken dialogue in \`<font color='HEX'>"..."</font>\` using their assigned color from VIR context. Extension auto-assigns if missing.
+
+## RULE 6 — EXAMPLE (full reply showing one new char + scene + state)
+
+She steps closer, hands clasped at her waist.
+
+\`\`\`vir
+{"schema":3,"characters":[{"name":"Belne","action":"create","species":"goblin","source":"original","age":"adult","height":"147cm petite","hair":"dark green waist-length wavy ponytail","eyes":"orange round large","face":"soft small nose pointed ears","skin":"light mint-green smooth warm","body":"petite curvaceous large G-cup slim waist thick thighs","marks":"none","outfit":"beige cotton tunic; brown leather belt; brown sandals","accessories":"brass hoop earrings","voice_gender":"female","voice_vocab":"casual","voice_color":"#FFCC80"}],"scene":{"location":"inn common room","time":"evening","weather":"clear","active":"Belne"},"states":[{"name":"Belne","position":"standing beside bed","aftermath":0}]}
+\`\`\`
+
+## RULE 7 — MINIMAL EMISSION (when nothing changed)
+
+\`\`\`vir
+{"schema":3,"scene":{"active":"Belne"}}
+\`\`\`
+
+## RULE 8 — FORBIDDEN | CORRECT
+
+| FORBIDDEN | CORRECT |
+|-----------|---------|
+| Omitting the \`\`\`vir block | Always include as last thing in reply |
+| Multi-line JSON inside the fence | Single line of JSON |
+| Nested \`voice_lock\` object | Flat \`voice_*\` fields |
+| \`outfit\` as array | \`outfit\` as semicolon-separated string |
+| \`active\` as array | \`active\` as comma-separated string |
+| Object-keyed-by-name (\`{"Belne":{...}}\`) | Array of objects with name field (\`[{"name":"Belne",...}]\`) |
+| Trailing commas | No trailing commas |
+| Comments in JSON | No comments |
+| Fence mid-prose or inside \`<details>\`/\`<think>\` | Fence at absolute end, top-level |
+
+## RULE 9 — OUTPUT ORDER
+
+1. Prose / dialogue / inline \`<pic>\` tags
+2. Plot Momentum / RPG HUD / other tracker blocks
+3. The \`\`\`vir code-fence block (ALWAYS LAST)
+
+## RULE 10 — FIRST-TURN INIT
+
+On first reply with a new character, emit them as \`{"name":"...","action":"create",...}\` with ALL known fields populated. Skipping fields creates visual drift later.
+</vir_contract>`;
+
+// ============================================================================
+// SETTINGS / LOGGING
+// ============================================================================
 function settings() {
     extension_settings[EXT] = Object.assign({}, defaultSettings, extension_settings[EXT] || {});
     return extension_settings[EXT];
 }
-
 function log(...args)   { if (settings().debug) console.log(`[${EXT}]`, ...args); }
 function warn(...args)  { console.warn(`[${EXT}]`, ...args); }
 function error(...args) { console.error(`[${EXT}]`, ...args); }
-
 function toastInfo(msg) { if (settings().debug) toastr.info(msg, 'FF4 VIR Sync'); }
 
 function uniqueClean(values) {
     return [...new Set((values || []).map(v => String(v || '').trim()).filter(Boolean))];
 }
 
-function escapeHtml(str) {
-    return String(str).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
-}
-
 function noteSyncStatus(message, warnings = [], isError = false) {
     const st = settings();
     st.lastSyncStatus = message;
     st.lastSyncAt = Date.now();
-    if (isError) st.lastError = message;
     if (warnings.length) {
         st.recentWarnings = [...uniqueClean(warnings), ...(st.recentWarnings || [])].slice(0, MAX_RECENT_WARNINGS);
     }
+    if (isError) st.recentWarnings.unshift(`ERROR: ${message}`);
     saveSettingsDebounced();
     updateStatus();
 }
 
-function safeNamePart(value) {
-    return String(value || 'chat')
-        .replace(/\.[^/.]+$/, '')
-        .replace(/[<>:"/\\|?* -]/g, '_')
-        .replace(/\s+/g, ' ')
-        .trim()
-        .slice(0, 90) || 'chat';
-}
-
+// ============================================================================
+// WORLD RESOLUTION
+// ============================================================================
 function hashString(value) {
     let hash = 0;
     const text = String(value || '');
     for (let i = 0; i < text.length; i++) hash = ((hash << 5) - hash + text.charCodeAt(i)) | 0;
     return Math.abs(hash).toString(36);
 }
-
-function isVirWorldName(name) {
-    return String(name || '').startsWith(WORLD_PREFIX) || OLD_WORLD_NAMES.has(String(name || ''));
+function safeNamePart(value) {
+    return String(value || 'chat').replace(/\.[^/.]+$/, '').replace(/[<>:"/\\|?* -]/g, '_').replace(/\s+/g, ' ').trim().slice(0, 90) || 'chat';
 }
-
-// ------------------------------------------------------------------
-// World resolution + chat binding
-// ------------------------------------------------------------------
+function isVirWorldName(name) {
+    return String(name || '').startsWith(WORLD_PREFIX);
+}
 function currentWorldName() {
     const chatId = getCurrentChatId();
     if (!chatId) return null;
     const stableId = chat_metadata?.integrity || chatId;
     const suffix = hashString(stableId);
-
-    // 1) Honor chat_metadata.world_info binding if it points at a FF4 VIR world
     const bound = chat_metadata?.[WI_METADATA_KEY];
-    if (bound && isVirWorldName(bound) && (world_names || []).includes(bound)) {
-        return bound;
-    }
-
-    // 2) Match existing FF4 VIR world by stable suffix
-    const existing = (world_names || []).find(name =>
-        String(name).startsWith(WORLD_PREFIX) && String(name).endsWith(`-${suffix}`));
+    if (bound && isVirWorldName(bound) && (world_names || []).includes(bound)) return bound;
+    const existing = (world_names || []).find(n => String(n).startsWith(WORLD_PREFIX) && String(n).endsWith(`-${suffix}`));
     if (existing) return existing;
-
-    // 3) Match by mapped chat ID
     const mapped = settings().worldChatMap || {};
-    const fromMap = Object.entries(mapped).find(([w, info]) =>
-        info?.chatId === String(chatId) && (world_names || []).includes(w));
+    const fromMap = Object.entries(mapped).find(([w, info]) => info?.chatId === String(chatId) && (world_names || []).includes(w));
     if (fromMap) return fromMap[0];
-
-    // 4) Synthesize new
     return `${WORLD_PREFIX}${safeNamePart(chatId)}-${suffix}`;
 }
-
 function rememberWorldChat(worldName, chatId = getCurrentChatId()) {
     if (!worldName || !chatId) return;
-    const context = getContext();
-    const avatar = context?.characters?.[context.characterId]?.avatar || null;
     const st = settings();
     st.worldChatMap = st.worldChatMap || {};
-    st.worldChatMap[worldName] = {
-        chatId: String(chatId),
-        integrity: chat_metadata?.integrity || null,
-        avatar,
-        updatedAt: Date.now(),
-    };
+    st.worldChatMap[worldName] = { chatId: String(chatId), integrity: chat_metadata?.integrity || null, updatedAt: Date.now() };
     saveSettingsDebounced();
 }
 
-function matchingWorldsForChat(chatId) {
-    const safeChat = safeNamePart(chatId);
-    const mapped = settings().worldChatMap || {};
-    return (world_names || []).filter(name => {
-        if (!isVirWorldName(name)) return false;
-        if (mapped[name]?.chatId === chatId) return true;
-        return String(name).startsWith(`${WORLD_PREFIX}${safeChat}-`);
-    });
-}
-
-// ------------------------------------------------------------------
-// Name canonicalization (preserved from v1 — well-tuned)
-// ------------------------------------------------------------------
-function canonicalizeName(rawName, payload = null) {
-    const original = String(rawName || '').replace(/\s+/g, ' ').trim();
-    const vir = payload?.vir || payload || {};
-    const explicit = String(payload?.canonical_name || vir?.canonical_name || vir?.name || '').replace(/\s+/g, ' ').trim();
-    const source = String(vir?.source || vir?.franchise || payload?.source || payload?.franchise || '').trim();
-    let canonical = explicit || original;
-    const warnings = [];
-
-    canonical = canonical.replace(/^[\s"'“”‘’`]+|[\s"'“”‘’`]+$/g, '').replace(/\s+/g, ' ').trim();
-
-    if (canonical) {
-        const stripped = canonical.replace(SCENARIO_NAME_SUFFIX_RE, '').replace(/\s+/g, ' ').trim();
-        if (stripped && stripped !== canonical) {
-            warnings.push(`Name normalized: "${canonical}" -> "${stripped}"`);
-            canonical = stripped;
-        }
-    }
-    if (!canonical) canonical = original || 'Unknown';
-    if (source && NAME_NOISE_RE.test(canonical)) {
-        warnings.push(`Name "${canonical}" still contains scenario wording; check canonical identity for source "${source}".`);
-    }
-    const aliases = uniqueClean([
-        original,
-        explicit && explicit !== canonical ? explicit : '',
-        ...(Array.isArray(payload?.aliases) ? payload.aliases : []),
-        ...(Array.isArray(vir?.aliases) ? vir.aliases : []),
-    ]).filter(a => a !== canonical);
-    return { canonical, aliases, warnings };
-}
-
-function renameObjectKeys(object, nameMap) {
-    if (!object || typeof object !== 'object' || Array.isArray(object)) return object;
-    const renamed = {};
-    for (const [name, value] of Object.entries(object)) renamed[nameMap.get(name) || name] = value;
-    return renamed;
-}
-
-function normalizeSyncPacket(sync) {
-    const normalized = structuredClone(sync);
-    const warnings = [];
-    const nameMap = new Map();
-
-    normalized.new_characters = {};
-    for (const [name, payload] of Object.entries(sync.new_characters || {})) {
-        const info = canonicalizeName(name, payload);
-        const nextPayload = structuredClone(payload || {});
-        nextPayload.aliases = uniqueClean([...(nextPayload.aliases || []), ...info.aliases]);
-        if (normalized.new_characters[info.canonical]) {
-            const old = normalized.new_characters[info.canonical];
-            normalized.new_characters[info.canonical] = {
-                ...nextPayload,
-                aliases: uniqueClean([...(old.aliases || []), ...(nextPayload.aliases || [])]),
-                vir: mergeVir(old.vir || old, nextPayload.vir || nextPayload),
-            };
-            warnings.push(`Merged duplicate packet names into "${info.canonical}".`);
-        } else {
-            normalized.new_characters[info.canonical] = nextPayload;
-        }
-        nameMap.set(name, info.canonical);
-        warnings.push(...info.warnings);
-    }
-
-    normalized.vir_delta = {};
-    for (const [name, delta] of Object.entries(sync.vir_delta || {})) {
-        const existingPayload = sync.new_characters?.[name] || delta;
-        const info = canonicalizeName(name, existingPayload);
-        normalized.vir_delta[info.canonical] = delta;
-        nameMap.set(name, info.canonical);
-        warnings.push(...info.warnings);
-    }
-
-    if (normalized.scene_state && typeof normalized.scene_state === 'object') {
-        normalized.scene_state.active_characters = uniqueClean(normalized.scene_state.active_characters || [])
-            .map(name => {
-                const info = canonicalizeName(name);
-                nameMap.set(name, info.canonical);
-                warnings.push(...info.warnings);
-                return info.canonical;
-            });
-        for (const name of Object.keys(normalized.scene_state.characters || {})) {
-            if (!nameMap.has(name)) {
-                const info = canonicalizeName(name);
-                nameMap.set(name, info.canonical);
-                warnings.push(...info.warnings);
-            }
-        }
-        normalized.scene_state.characters = renameObjectKeys(normalized.scene_state.characters, nameMap);
-    }
-    return { sync: normalized, warnings: uniqueClean(warnings) };
-}
-
-// ------------------------------------------------------------------
-// Lorebook entry shape
-// ------------------------------------------------------------------
+// ============================================================================
+// LOREBOOK HELPERS
+// ============================================================================
 function getEntries(data) {
-    data.entries = data.entries && typeof data.entries === 'object' ? data.entries : {};
-    return data.entries;
+    if (!data) return {};
+    if (data.entries && typeof data.entries === 'object') return data.entries;
+    return data.entries = {};
 }
-
 function nextUid(data) {
     const entries = getEntries(data);
-    const ids = Object.keys(entries).map(Number).filter(Number.isFinite);
+    const ids = Object.keys(entries).map(k => parseInt(k, 10)).filter(n => !isNaN(n));
     return ids.length ? Math.max(...ids) + 1 : 0;
 }
-
-function makeEntry({ uid, key, comment, content, constant=false, order=100, depth=2, position=0, role='system' }) {
+function makeEntry({ uid, key, comment, content, constant = false, disable = false, order = 100, depth = 4, position = 4 }) {
     return {
-        uid,
-        key: Array.isArray(key) ? key.filter(Boolean) : [String(key||'')].filter(Boolean),
-        keysecondary: [],
-        comment, content, constant,
-        selective: false,
-        order, position,
-        disable: false,
-        addMemo: true,
-        group: constant ? 'VIR_SYSTEM' : 'VIR_CHARACTERS',
-        groupOverride: false, groupWeight: 100,
-        sticky: 0, cooldown: 0, delay: 0,
-        probability: 100, useProbability: true,
-        depth, role,
-        vectorized: false,
-        excludeRecursion: false,
-        preventRecursion: false,
-        delayUntilRecursion: false,
-        scanDepth: null, caseSensitive: null,
-        matchWholeWords: null, useGroupScoring: null,
-        automationId: '',
+        uid, key: Array.isArray(key) ? key : [key],
+        keysecondary: [], comment: String(comment || ''),
+        content: String(content || ''), constant, disable,
+        order, depth, position, probability: 100, useProbability: true,
+        addMemo: true, selective: true, group: '', groupOverride: false, groupWeight: 100,
+        scanDepth: null, caseSensitive: null, matchWholeWords: null, useGroupScoring: null,
+        automationId: '', role: null, sticky: null, cooldown: null, delay: null,
     };
 }
 
-// ------------------------------------------------------------------
-// VIR content rendering
-// ------------------------------------------------------------------
+// ============================================================================
+// VIR CONTENT GENERATION
+// ============================================================================
 function textValue(value) {
-    if (Array.isArray(value)) return value.map(textValue).join(' ');
-    if (value && typeof value === 'object') return Object.values(value).map(textValue).join(' ');
-    return String(value ?? '').trim();
+    if (Array.isArray(value)) return value.map(textValue).filter(Boolean).join('; ');
+    if (value && typeof value === 'object') return Object.entries(value).filter(([, v]) => v).map(([k, v]) => `${k}: ${textValue(v)}`).join('; ');
+    return String(value || '').trim();
 }
-
 function compactValue(value) {
-    if (value == null || value === '' || (Array.isArray(value) && !value.length)) return '';
-    if (Array.isArray(value)) return value.map(compactValue).filter(Boolean).join('; ');
-    if (typeof value === 'object') {
-        return Object.entries(value)
-            .filter(([, v]) => v != null && v !== '' && (!Array.isArray(v) || v.length))
-            .map(([k, v]) => `${k}=${compactValue(v)}`).join(', ');
-    }
-    return String(value).trim();
+    const text = textValue(value);
+    return text || '';
 }
-
 function compactPiece(piece) {
     if (typeof piece === 'string') return piece.trim();
     if (!piece || typeof piece !== 'object') return '';
-    const slot = piece.slot ? `${piece.slot}: ` : '';
+    const slot = piece.slot ? `[${piece.slot}] ` : '';
     const main = [
-        piece.exact_color_shade || piece.color || piece.color_shade,
+        piece.color_shade || piece.color,
         piece.material,
         piece.item_type || piece.type || piece.item,
         piece.cut_or_style || piece.cut || piece.style,
-        piece.fit,
-        piece.distinguishing_detail || piece.detail,
-        piece.condition,
+        piece.fit, piece.distinguishing_detail || piece.detail, piece.condition,
     ].filter(Boolean).join(' ');
     return `${slot}${main}`.trim();
 }
-
 function compactList(label, items) {
     if (!Array.isArray(items) || !items.length) return [];
     return items.map((item, index) => `${label}${index + 1}: ${compactPiece(item) || compactValue(item)}`)
@@ -436,8 +334,9 @@ function lockedVisualCard(name, vir = {}) {
         ...compactList('UNDERWEAR ', vir.underwear),
         ...compactList('ACCESSORY ', vir.accessories),
         ...compactList('EQUIPMENT ', vir.equipment),
+        vir.voice_lock?.dialogue_color ? `DIALOGUE_COLOR: ${vir.voice_lock.dialogue_color}` : '',
         `[/LOCKED VISUAL CARD]`,
-    ].filter(line => !line.endsWith(': ') && !line.endsWith(':'));
+    ].filter(line => line && !line.endsWith(': ') && !line.endsWith(':'));
     return lines.join('\n');
 }
 
@@ -449,257 +348,20 @@ ${lockedVisualCard(name, vir)}
 [/ACTIVE VIR]`;
 }
 
-function schemaContent() {
-    return `<ff4_vir_lorebook_rules>
-SOURCE OF TRUTH: lorebook [ACTIVE VIR] / [LOCKED VISUAL CARD] / [VIR_SCENE_INDEX] / [VIR_ROSTER] entries for THIS chat only. Never use global same-name memory.
-COPY locked card lines VERBATIM into every <pic>. No paraphrase, no color shift, no resize, no invented anatomy.
-LOCKED VS MUTABLE: locked fields describe character as they NORMALLY exist (clothed, undisturbed, neutral). Mutable state ("currently X", "now Y", "previously Z", "still W", "pushed aside", "discarded on floor", "rolling back", "stretched around", "leaking", "exposed", outfit/hair state, position, held items, injuries) belongs ONLY in scene_state.characters[name]: position, condition, outfit_state, hair_state, held_items, injuries.
-NEW CHAR: full new_characters entry with all locked fields (species, source, age_appearance, height, hair, eyes, face_features, brow_lash, lips_teeth, skin_fur_scales, body, hands_feet, posture_voice, marks, outfit array, underwear, accessories, equipment).
-LOCKED FIELD CHANGE: emit vir_delta with ONLY the changed locked field(s) -- never re-emit full VIR.
-RECALL: To bring back a character whose name has not appeared in 10+ recent turns, emit recall_characters: ["Name1", "Name2"] in your vir_sync packet. The extension bumps them to active for the next reply so their [LOCKED VISUAL CARD] is injected.
-NAME LOCK: use canonical name only (no scenario suffixes/route names in keys or pic paragraphs).
-OUTPUT: never dump raw VIR JSON in normal prose; only inside <vir_sync>...</vir_sync> as its own block after Plot Momentum.
-</ff4_vir_lorebook_rules>`;
-}
-
-
-// ------------------------------------------------------------------
-// FF4 Pic Format Rules — migrated from preset jailbreak
-// Maintained inside the extension so the preset stays slim.
-// ------------------------------------------------------------------
-function picRulesContent() {
-    return `<ff4_pic_format_rules>
-â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-VISUAL OUTPUT PROTOCOL â€” NATURAL LANGUAGE
-â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-
-SYNTAX: <pic prompt='...' type='TYPE'>. TYPE must be EXACTLY one of: portrait, landscape, closeup, scene, square. Never use medium, fullbody, wide, image, cinematic, or any other type. If unsure use scene for multi-character action, portrait for one full character. One unbroken paragraph inside prompt='...'. Never markdown images. Never 'Image Prompt:' as plain text.
-
-TYPE SELECTION: portrait = solo character/outfit reveal. closeup = strong emotion/face/intimacy. scene = multi-character action/combat/group. landscape = establishing/travel/vista. square = vignette/bust. Invalid type = format failure.
-
-MANDATORY PROMPT STRUCTURE (this exact order, every pic):
-
-[1] STYLE ANCHOR: "@xlvxp, masterpiece, highly detailed, very aesthetic, cinematic lighting."
-
-[2] RATING: Choose from current visible prose only. Use "Safe-for-work content." unless clothing is visibly revealing, nudity is currently exposed, or sex is currently shown. Use "Suggestive content with partial nudity." only when prose already shows exposed skin/underwear/near-nudity. Use "Explicit adult content showing [specific acts]." only when explicit anatomy/sex is currently visible. Never let rating invent nudity.
-
-[3] SCENE SETTING (1-2 sentences): exact location with 3-5 visual details from current prose, time-of-day lighting matching header, weather/atmosphere, mood lighting (tense=hard shadows high contrast, intimate=soft warm, horror=cold blue deep shadows, action=dynamic high contrast, grief=muted cool desaturated, triumph=bold contrast low angle, magical=unnatural color tint runic glow), persistent scene objects, light direction (key_light source+direction, rim_light, ambient). Indoor scenes: header time affects window light and whether candles/lamps are lit.
-
-[4] CAMERA (one sentence): shot type (extreme closeup / closeup waist-up / cowboy waist-up / medium full-body / wide full-environment / extreme wide distant), angle (eye-level / low / high / dutch / side). FPP: add "first-person POV from {{user}}'s eyes" or "POV shot, from the viewer's perspective".
-
-[5] COUNT ANCHOR: "There are exactly N characters in this scene, no extra people, no duplicate characters, no twins." (FPP: exclude {{user}})
-
-[5.5] CANONICAL NAME LOCK: Character paragraph names must be the character's actual canon/persona name only. Do not append scenario/card-title tags, genre labels, relationship labels, kink labels, route labels, mode words, outfit labels, location labels, or plot descriptors to the name. Forbidden name suffixes include Netori, NTR, Roleplay, Scenario, AU, Alt, version labels, outfit labels, location labels, and plot descriptors unless the card/VIR says they are literally part of the character's legal/name field. For canon characters, write "[Name] from [Franchise]" using the canon name, e.g. "Ymir from Attack on Titan", never "Ymir Netori from Attack on Titan". If the card title is "Ymir Netori" but the character identity is Ymir from Attack on Titan, use "Ymir" as FULL NAME and put Netori only in scenario/plot context if needed, never in the name.
-
-[6] CHARACTER PARAGRAPHS â€” one per character, each starting with FULL NAME (POSITION): then covering ALL of the following as connected prose (not tag lists):
-
-  a) SPECIES + FRANCHISE: "[Name] (original character) is a young woman..." or "[Name] from [Franchise] is...". Non-human: include species_class + humanoid_ratio.
-  b) HAIR: VERBATIM from [ACTIVE VIR] â€” exact color_shade + length + style + texture + bangs + parting. Append scene modifiers (wet/wind-blown/messy). NEVER shorten "waist-length wavy light cerulean blue hair" to "blue hair".
-  c) EYES: exact color + shape + current gaze direction + current state (tearful/wide/half-lidded).
-  d) SKIN/BODY/ANATOMY: exact tone + build + height in cm + locked proportions copied from VIR: bust/breast size, ass/hip size, thigh build, waist, muscle/fat, penis/cock size if visible or relevant, balls if visible/relevant, pussy/vulva/clit detail if visible/relevant, current state (flushed/sweaty/goosebumps/erect/wet). Non-human: fur/scales/chitin zones verbatim. Never resize breasts, dick, ass, hips, height, muscles, or body type unless prose explicitly changes them.
-  e) NON-HUMAN FEATURES: tail/wings/horns/ears/claws/fangs/antennae/exoskeleton VERBATIM from VIR when applicable.
-  f) MARKS: scars/tattoos/piercings/freckles/moles VERBATIM from VIR.
-  g) OUTFIT: EVERY piece layer-by-layer top-to-bottom with exact_color_shade + material + item_type + cut + distinguishing_detail + condition. NEVER summarize as "her usual outfit" or "same as before". NEVER drop pieces. NEVER synonym-swap (burgundyâ‰ wine, silkâ‰ satin, bootsâ‰ shoes, brassâ‰ gold). Before writing a pic, silently checksum each visible outfit piece by slot/item/color/material/cut/detail; only condition may change unless prose changed clothing first.
-  h) ACCESSORIES + EQUIPMENT: each with exact material + exact stone/color shade + position. Rings, glasses, earrings, ribbons, chokers, belts, bags, weapons, staffs, collars, piercings, and nail polish stay visible and unchanged until prose removes them.
-  i) POSE: specific action from current prose beat (never default "standing"), hands + what they hold, body orientation (front/rear/side/3-quarter facing camera).
-  j) EXPRESSION: keyword (angry/scared/sad/happy/aroused/pain/surprised/smug/focused/nervous/dominant/exhausted/playful/ahegao/gagging) + physical cues (brows/mouth/eyes/posture).
-
-[7] INTERACTION LINE (when characters touch or act on each other): ONE sentence using FULL NAMES, never pronouns. For NSFW: NEVER abstract verbs ("performs oral", "has sex with"). ALWAYS plain physical geometry: "[Name] kneels in front of [Name] with her mouth around his erect penis" â€” describe who is above/below/behind/in front, what touches what.
-
-[8] VERIFICATION CLOSER: "All N characters are visible in the frame at their stated positions; no extra people or duplicate versions are present."
-
-COLOR + BODY LOCKS: Copy exact color words from VIR; never synonym-swap or shade-shift. midnight navy stays midnight navy, not dark blue; platinum-blonde stays platinum-blonde, not silver/white; black leather stays black leather, not brown shoes; gold buttons stay gold, not brass. Copy material too: silkâ‰ satin, leatherâ‰ cloth, tightsâ‰ socks. Body/anatomy proportions are locked identifiers: breast size, dick size, ass size, height, skin tone, fur/scales/chitin zones, scars, piercings, and non-human traits cannot grow, shrink, vanish, or move unless prose changed them first and <vir_sync> updates them.
-
-FACE COLOR GUARD: Blush/flushing must be natural skin reddening only: write 'soft pink blush on cheeks only' or 'warm rose flush limited to cheeks and ears'. Never write deep/vivid crimson for blush. Do not create red streaks, blood, face paint, smeared makeup, facial markings, cuts, or stains unless prose explicitly states blood/paint/markings. If squeezing cheeks, describe normal skin compression and cheek blush only.
-
-ANTI-BLEEDING RULES (mandatory every multi-character pic):
-- Each character paragraph is SELF-CONTAINED. NO pronouns crossing paragraphs. Start with "Only one [Canonical Full Name] is present" when the character has common features like school uniform, glasses, blonde hair, cat ears, horns, wings, or tail. Use the canonical/persona name only, not card title, scenario tag, route label, or kink label.
-- NO comparative phrasing: forbidden = "both wearing", "similar to", "matching", "same as", "like the other".
-- Two characters NEVER share identical outfit prose. Even if similar, distinguish by color/material/accessory.
-- Lead each paragraph with the character's most visually DISTINCT feature.
-- Different POSITION labels per character: Left/Right/Centre/Foreground/Background.
-
-ANATOMY VISIBILITY GATES (NSFW):
-- REAR VIEW: ass, anus, back torso, nape. NEVER breasts, nipples, front torso.
-- FRONT VIEW: breasts, nipples, front torso, pussy front. NEVER ass, back.
-- SIDE VIEW: only that angle's anatomy.
-- Never mix incompatible views in one pic.
-
-NSFW POSE EMPHASIS â€” state pose mechanics in THREE places:
-(1) Position label: "Marah (foreground, kneeling upright with her mouth around ETS's erect penis):"
-(2) Pose sentence in paragraph: full physical description of body position + contact.
-(3) Interaction line: "Marah kneels in front of ETS with her mouth around his erect penis."
-All three MUST be consistent. Never use jargon alone ("fellatio", "doggy style"). Always write plain physical geometry: who is above/below/behind, what body parts touch, where hands grip.
-
-JARGON â†’ PLAIN GEOMETRY (always use the right column):
-  fellatio â†’ her mouth wrapped around his erect penis, lips sealed around shaft
-  doggy style â†’ she on hands and knees, he kneels behind, hands gripping her hips
-  missionary â†’ she on back legs bent open, he above between her legs
-  cowgirl â†’ she straddles him facing forward, hips lowered onto his
-  mating press â†’ she on back, legs folded to shoulders, he leans over pressing down
-  full nelson â†’ he behind her, arms under armpits, hands behind head, lifting her
-  prone bone â†’ she face-down flat, he on top chest to back
-  standing carry â†’ he stands holding her thighs, she wraps legs around waist
-
-SCENE COHERENCE: One pic = one frozen moment. Never combine sequential actions. Cross-pic continuity in same response: same lighting, outfit state, injuries, weather, scene objects. Camera height stays consistent unless prose moves it.
-
-SPATIAL RULES: State each character's height (cm) once; add comparative phrase when heights differ >5cm. State distance, eye-level offset, contact points using full names, gaze targets. 3+ characters: Foreground/Midground/Background labels -- never flatten to a lineup.
-
-ACTION MATCH: The pic must depict the latest visible action requested or narrated in the 1-3 sentences immediately before it. The foreground/focus character is the character performing that latest action. If Shouko adjusts glasses and steps out, Shouko is the focus; if Haru grabs, Haru is the focus; if {{user}} acts, show the physical result. If {{user}} asks for a reveal, undressing, attack, kiss, grab, movement, or reaction, the pic captures that exact beat, not an earlier generic stance. If one reply contains several visible changes, emit several inline pics.
-
-USER/PERSONA VIR: In TPP, {{user}} is a visible character and needs [ACTIVE VIR] or same-turn new_characters like any NPC. If {{user}} lacks VIR and appears in a pic, create one from persona/prose with exact hair, eyes, skin, height, body build, outfit, accessories, equipment, and NSFW anatomy sizes if relevant. In FPP, {{user}} is the camera, but visible viewer body parts/genitals still use {{user}} VIR/body facts.
-
-PRE-PIC CHECKLIST (before every pic):
-  VIR LOCK: For each character, recall their [ACTIVE VIR] or [LOCKED VISUAL CARD]; copy exact values into paragraph; cross-check outfit/body/anatomy against story state (removed? damaged? exposed?).
-  SCENE BEAT: From current prose -- ACTION, FOCUS CHARACTER, LOCATION, OBJECTS, MOOD. These drive the pic. Focus character is largest/clearest; background chars smaller/simpler. Wrong action, wrong location, invented nudity, or extra/duplicate people = failed pic.
-
-PEAK MOMENT CAPTURE: Every pic captures the HIGHEST DRAMATIC MOMENT â€” the grab, the strike, the kiss, the revelation â€” not the calm aftermath. Avoid defaulting to "character standing in room" or "character looking at viewer".
-
-ADDITIONAL POSE TRANSLATIONS (always write the right column):
-  reverse cowgirl â†’ she straddles him facing his feet, back to him, hips lowered
-  spoons â†’ both on sides, he behind her, chest to back, arm under neck
-  throat fuck â†’ she kneels/lies mouth aligned to his hips, he at her head
-  piledriver â†’ she inverted shoulders on ground hips above face, he squats over
-  amazon â†’ she bent over him from above, he on back hips lifted
-  lotus â†’ both sit chest to chest, he cross-legged, she in his lap legs around waist
-  standing doggy â†’ she bends forward gripping surface, he stands behind hips to rear
-  standing from behind â†’ she stands gripping wall, he behind hips against her rear
-
-VIEW-ORIENTATION VOCABULARY â€” determine which body surface faces camera from prose:
-  Chest/front â†’ "chest and torso face camera"  |  Back â†’ "back faces camera"
-  Left side â†’ "left side faces camera"  |  Right side â†’ "right side faces camera"
-  3/4 front-left â†’ "body angles left, chest partially visible"  |  3/4 rear â†’ "body angles away, back partially visible"
-  Walking direction MUST match orientation: body faces right = walks right across frame.
-  Front view ONLY when chest explicitly faces camera. Never default to front.
-
-OCCLUSION COHERENCE â€” when one character is beneath/behind/under another:
-  Describe ONLY what the camera can see. Write a MINIMAL paragraph for the hidden character: FULL NAME + (Under, hidden by [other name]) + only visible parts (hands, partial face). Skip hair/eyes/full outfit if body is fully hidden. "Face hidden" instead of expression. Do NOT pack full 10-category description onto a body the camera cannot see â€” that spawns ghost duplicate bodies.
-
-CONTINUITY: Carry all states forward in every pic until prose reverses.
-  Per-character: hair_state, injuries, outfit_damage, held_items, makeup/body, gaze target. Scene-wide: key_light, rim_light, ambient, palette, camera baseline.
-  injury → wound/blood until healed. weather → wet/soaked until dried. combat → torn/dirty until cleaned. emotion → tear stains/red eyes 2-3 turns. undress → bare skin until re-dressed. props → weapon/item in pose clause. hair modifiers (wet/wind-blown/messy) appended AFTER base VIR hair phrase, removed when state clears.
-
-TIME-OF-DAY LIGHTING: Cross-ref header time before every scene setting.
-  Dawn/morning (5-11AM): warm rising sun, long shadows. Midday (11AM-2PM): harsh overhead, short shadows. Afternoon/golden hour (2-7PM): warm golden slant, lengthening shadows. Dusk/evening (7-10PM): sunset orange-pink fading to lamp-lit glow. Night (10PM-5AM): moonlight, deep shadows, torchlight/candlelight. Indoor: time affects window brightness + whether lamps/candles are lit.
-
-PROSEâ†’VISUAL TRANSLATION â€” read 2-3 sentences before the <pic> and ensure every concrete element appears:
-  rain â†’ wet cobblestones, puddles, dark clouds, damp hair. fire â†’ burning object, orange firelight, smoke. blood â†’ blood on floor/clothing/body. broken object â†’ debris in scene. darkness â†’ dim lighting, deep shadows. storm â†’ lightning, dark clouds, wind-blown hair. magic â†’ glowing runes, energy burst. draws sword â†’ sword drawn, hilt gripped. runs â†’ mid-stride, hair flying. grabs â†’ hand gripping body part/object, knuckles white. crying â†’ tears streaming, hand covering face. slams object â†’ object striking surface, impact.
-
-CAMERA SELECTION MATRIX:
-  1 character: any camera. 2 close/touching: medium or wider. 2 far apart: wide only. 3+ all close: medium or wider. 3+ any spread: wide ONLY. Strong emotion 1-2 close: closeup. Dominant/scary: low angle. Defeated: high angle. Fast action: dutch angle. Any character across room/near door/background: wide REQUIRED. Vary camera types between consecutive pics for visual rhythm. Failsafe if uncertain: wide shot.
-
-FPP INTERACTION POSES (when {{user}} physically interacts with character):
-  Back-to-camera (pressed against viewer): rear view, viewer's arms enter bottom wrapping waist. Straddling viewer's lap: front view, character straddles, viewer's hands at bottom gripping hips/thighs. Hugging viewer: slightly high angle looking down, character presses against viewer. Forehead/kissing: extreme closeup, character's face fills frame, viewer's hands may cup face. Lying side-by-side: eye-level at pillow height. Head on viewer's chest: high angle looking down. In ALL FPP poses: viewer's body parts enter from BOTTOM of frame only, never show viewer's face/head/shoulders.
-
-SCENE OBJECT PERSISTENCE â€” when prose establishes an environment object (body on floor, broken door, fire in hearth, overturned table, weapon on ground, wanted poster, magic circle), include it in SCENE SETTING of every pic in that location until prose removes it.
-
-LIGHT DIRECTION PERSISTENCE â€” within one scene, key_light and rim_light directions are LOCKED. Never flip light direction between consecutive pics in the same beat. State three light fields in scene setting: key_light (source+direction+color), rim_light (direction+color), ambient (fill source).
-
-PIC EXAMPLE: Apply the [1]-[8] structure above exactly -- every field, every pic, in that order. No exceptions.
-</ff4_pic_format_rules>`;
-}
-function sceneIndexContent(sceneState = {}) {
-    const lines = ['[VIR_SCENE_INDEX]'];
-    if (sceneState.location) lines.push(`LOC: ${sceneState.location}`);
-    if (sceneState.time) lines.push(`TIME: ${sceneState.time}`);
-    if (sceneState.weather) lines.push(`WEATHER: ${sceneState.weather}`);
-    const active = Array.isArray(sceneState.active_characters) ? sceneState.active_characters : [];
-    if (active.length) lines.push(`ACTIVE: ${active.join(', ')}`);
-    for (const [name, state] of Object.entries(sceneState.characters || {})) {
-        if (!state || typeof state !== 'object') continue;
-        const parts = [name];
-        if (state.position) parts.push(state.position);
-        if (state.condition && state.condition !== 'normal') parts.push(state.condition);
-        if (state.outfit_state) parts.push(`outfit:${state.outfit_state}`);
-        if (state.hair_state) parts.push(`hair:${state.hair_state}`);
-        if (Array.isArray(state.held_items) && state.held_items.length) parts.push(`holding:${state.held_items.join('/')}`);
-        if (state.injuries) parts.push(`injuries:${state.injuries}`);
-        lines.push(parts.join(' | '));
-    }
-    if (sceneState.lighting) lines.push(`LIGHTING: ${compactValue(sceneState.lighting)}`);
-    lines.push('[/VIR_SCENE_INDEX]');
-    return lines.join('\n');
-}
-
-function parseSceneState(entry) {
-    if (!entry) return {};
-    const m = String(entry.content || '').match(/\[VIR_SCENE_INDEX\]([\s\S]*?)\[\/VIR_SCENE_INDEX\]/);
-    if (!m) return {};
-    const text = m[1].trim();
-    try { const p = JSON.parse(text); if (p && typeof p === 'object') return p; } catch {}
-    const state = { characters: {} };
-    for (const line of text.split('\n')) {
-        const t = line.trim();
-        if (!t) continue;
-        if (t.startsWith('LOC: ')) state.location = t.slice(5);
-        else if (t.startsWith('TIME: ')) state.time = t.slice(6);
-        else if (t.startsWith('WEATHER: ')) state.weather = t.slice(9);
-        else if (t.startsWith('LIGHTING: ')) state.lighting = t.slice(10);
-        else if (t.startsWith('ACTIVE: ')) state.active_characters = t.slice(8).split(',').map(s => s.trim()).filter(Boolean);
-        else if (t.includes(' | ')) {
-            const parts = t.split(' | ');
-            const name = parts[0]; if (!name) continue;
-            const cs = {};
-            for (const part of parts.slice(1)) {
-                if (part.startsWith('outfit:')) cs.outfit_state = part.slice(7);
-                else if (part.startsWith('hair:')) cs.hair_state = part.slice(5);
-                else if (part.startsWith('holding:')) cs.held_items = part.slice(8).split('/');
-                else if (part.startsWith('injuries:')) cs.injuries = part.slice(9);
-                else cs.position = part;
-            }
-            state.characters[name] = cs;
-        }
-    }
-    return state;
-}
-
-function mergeSceneState(existing, incoming) {
-    const merged = structuredClone(existing || {});
-    if (!incoming || typeof incoming !== 'object') return merged;
-    if (incoming.location !== undefined) merged.location = incoming.location;
-    if (incoming.time !== undefined) merged.time = incoming.time;
-    if (incoming.weather !== undefined) merged.weather = incoming.weather;
-    if (incoming.lighting !== undefined) merged.lighting = incoming.lighting;
-    if (Array.isArray(incoming.active_characters)) merged.active_characters = incoming.active_characters;
-    if (incoming.characters && typeof incoming.characters === 'object') {
-        merged.characters = merged.characters || {};
-        for (const [name, state] of Object.entries(incoming.characters)) {
-            merged.characters[name] = { ...(merged.characters[name] || {}), ...state };
-        }
-    }
-    return merged;
-}
-
-// ------------------------------------------------------------------
-// VIR merge + parse
-// ------------------------------------------------------------------
-function mergeVir(oldVir, delta) {
-    if (!oldVir || typeof oldVir !== 'object') return structuredClone(delta || {});
-    const result = structuredClone(oldVir);
-    for (const [key, value] of Object.entries(delta || {})) {
-        result[key] = value && typeof value === 'object' && !Array.isArray(value)
-            ? mergeVir(result[key], value) : value;
-    }
-    return result;
-}
-
 function parseActiveVir(content) {
-    // Try JSON block first
     const m = String(content || '').match(/\[ACTIVE VIR:[^\]]+\]\s*([\s\S]*?)\s*\[\/ACTIVE VIR\]/);
     if (!m) return {};
-    const jsonMatch = m[1].match(/\{[\s\S]*\}/);
-    if (jsonMatch) { try { return JSON.parse(jsonMatch[0]); } catch {} }
-    // Otherwise parse the compact card lines (legacy format)
     return parseCardLines(m[1]);
 }
-
 function parseCardLines(body) {
     const vir = {};
     const cardMatch = body.match(/\[LOCKED VISUAL CARD:[^\]]+\]([\s\S]*?)\[\/LOCKED VISUAL CARD\]/);
     if (!cardMatch) return {};
     for (const line of cardMatch[1].split('\n')) {
-        const t = line.trim(); if (!t) continue;
-        const idx = t.indexOf(':'); if (idx < 1) continue;
+        const t = line.trim();
+        if (!t) continue;
+        const idx = t.indexOf(':');
+        if (idx < 1) continue;
         const k = t.slice(0, idx).trim();
         const v = t.slice(idx + 1).trim();
         if (!v) continue;
@@ -718,6 +380,7 @@ function parseCardLines(body) {
         else if (k === 'POSTURE_VOICE') vir.posture_voice = v;
         else if (k === 'NON-HUMAN') vir.non_human = v;
         else if (k === 'MARKS') vir.marks = v;
+        else if (k === 'DIALOGUE_COLOR') { vir.voice_lock = vir.voice_lock || {}; vir.voice_lock.dialogue_color = v; }
         else if (k === 'IDENTITY') {
             const parts = v.split(',').map(s => s.trim()).filter(Boolean);
             if (parts[0]) vir.species = parts[0];
@@ -729,259 +392,44 @@ function parseCardLines(body) {
     return vir;
 }
 
-// ------------------------------------------------------------------
-// Quality validation
-// ------------------------------------------------------------------
-function assertDetailedField(name, field, value, minLength = 24) {
-    const text = textValue(value);
-    if (!text || text.length < minLength) return `${name} VIR field "${field}" is short for stable image prompting`;
-    if (WEAK_TEXT_RE.test(text)) return `${name} VIR field "${field}" uses weak/generic wording: ${text.slice(0, 80)}`;
-    return null;
+function mergeVir(oldVir, delta) {
+    if (!oldVir || typeof oldVir !== 'object') return structuredClone(delta || {});
+    const result = structuredClone(oldVir);
+    for (const [key, value] of Object.entries(delta || {})) {
+        result[key] = value && typeof value === 'object' && !Array.isArray(value)
+            ? mergeVir(result[key], value) : value;
+    }
+    return result;
 }
 
-function assertOutfit(name, outfit) {
-    if (!Array.isArray(outfit) || !outfit.length) return [`${name} VIR outfit should be a non-empty layer array`];
-    return outfit.map((layer, i) => assertDetailedField(name, `outfit[${i}]`, layer, 28)).filter(Boolean);
+function canonicalizeName(rawName, payload) {
+    const aliases = uniqueClean(payload?.aliases || []);
+    let canonical = String(rawName || '').trim();
+    canonical = canonical.replace(/\s*[(\[][^)\]]*[)\]]\s*/g, ' ').trim();
+    canonical = canonical.replace(/\s+/g, ' ').trim();
+    return { canonical, aliases };
 }
 
-function assertImageReadyVir(name, payload, opts = {}) {
-    const { includeRecommended = false } = opts;
-    const vir = payload?.vir || payload;
-    if (!vir || typeof vir !== 'object') return [`${name} VIR is missing`];
-    const nameInfo = canonicalizeName(name, payload);
-    const source = vir.source || vir.franchise;
-    const sourceText = textValue(source);
-    const w = [
-        ...nameInfo.warnings,
-        NAME_NOISE_RE.test(name) ? `${name} looks like a card/scenario title, not a canonical character name` : null,
-        sourceText && WEAK_TEXT_RE.test(sourceText) ? `${nameInfo.canonical} source/franchise uses weak wording: ${sourceText.slice(0, 80)}` : null,
-    ].filter(Boolean);
-    // Required fields: hard fail per packet
-    const missingRequired = REQUIRED_VIR_FIELDS.filter(f => !(f in vir));
-    if (missingRequired.length) {
-        w.push(`${nameInfo.canonical} VIR missing required field(s): ${missingRequired.join(', ')}`);
-    }
-    // Recommended fields: opt-in only (audit), and collapsed to a single warning
-    if (includeRecommended) {
-        const missingRec = RECOMMENDED_VIR_FIELDS.filter(f => !(f in vir));
-        if (missingRec.length >= RECOMMENDED_VIR_FIELDS.length) {
-            // All missing — old-format entry. Single softer warning.
-            w.push(`${nameInfo.canonical}: no new-field detail (${RECOMMENDED_VIR_FIELDS.join('/')}) — can be added gradually for higher visual consistency`);
-        } else if (missingRec.length > 0) {
-            w.push(`${nameInfo.canonical} missing recommended fields: ${missingRec.join(', ')}`);
-        }
-    }
-    // Mutable state leak detection (always run — high-value)
-    const lockedFieldsToScan = ['hair', 'eyes', 'face_features', 'brow_lash', 'lips_teeth', 'skin_fur_scales', 'body', 'hands_feet', 'posture_voice', 'marks', 'outfit', 'underwear', 'accessories', 'equipment'];
-    for (const f of lockedFieldsToScan) {
-        if (!(f in vir)) continue;
-        const txt = textValue(vir[f]);
-        if (txt && MUTABLE_STATE_PATTERN.test(txt)) {
-            const match = txt.match(MUTABLE_STATE_PATTERN);
-            w.push(`${nameInfo.canonical} locked field "${f}" contains mutable-state words ("${match[0]}") -- move to scene_state.characters[${nameInfo.canonical}], NOT locked VIR`);
-        }
-    }
-    // Per-field length checks (only if field exists)
-    const tests = [
-        vir.hair ? assertDetailedField(nameInfo.canonical, 'hair', vir.hair, 44) : null,
-        vir.eyes ? assertDetailedField(nameInfo.canonical, 'eyes', vir.eyes, 30) : null,
-        sourceText ? assertDetailedField(nameInfo.canonical, 'source/franchise', source, 4) : null,
-        vir.skin_fur_scales ? assertDetailedField(nameInfo.canonical, 'skin_fur_scales', vir.skin_fur_scales, 24) : null,
-        vir.body ? assertDetailedField(nameInfo.canonical, 'body', vir.body, 32) : null,
-        ...(vir.outfit ? assertOutfit(nameInfo.canonical, vir.outfit) : []),
-    ].filter(Boolean);
-    return [...w, ...tests];
-}
-
-const STRUCTURAL_KEY_NAMES = new Set(['vir_delta', 'new_characters', 'scene_state', 'schema', 'recall_characters', 'characters', 'aliases', 'vir']);
-
-function validateSyncPacket(sync) {
-    const w = [];
-    for (const [name, payload] of Object.entries(sync.new_characters || {})) {
-        if (STRUCTURAL_KEY_NAMES.has(String(name).toLowerCase())) {
-            w.push(`MALFORMED PACKET: "${name}" appears as a character name inside new_characters. That is a top-level vir_sync field, not a character. Move it out of new_characters.`);
-            continue;
-        }
-        w.push(...assertImageReadyVir(name, payload));
-    }
-    for (const [name, delta] of Object.entries(sync.vir_delta || {})) {
-        if (STRUCTURAL_KEY_NAMES.has(String(name).toLowerCase())) {
-            w.push(`MALFORMED PACKET: "${name}" appears as a character name inside vir_delta. That is a top-level vir_sync field, not a character.`);
-            continue;
-        }
-        if (!delta || typeof delta !== 'object') throw new Error(`${name} vir_delta must be an object`);
-        if ('hair' in delta) w.push(assertDetailedField(name, 'hair delta', delta.hair, 44));
-        if ('eyes' in delta) w.push(assertDetailedField(name, 'eyes delta', delta.eyes, 30));
-        if ('skin_fur_scales' in delta) w.push(assertDetailedField(name, 'skin_fur_scales delta', delta.skin_fur_scales, 24));
-        if ('body' in delta) w.push(assertDetailedField(name, 'body delta', delta.body, 32));
-        if ('outfit' in delta) w.push(...assertOutfit(name, delta.outfit));
-    }
-    return w.filter(Boolean);
-}
-
-// ------------------------------------------------------------------
-// Entry manipulation
-// ------------------------------------------------------------------
-function ensureBaseEntries(data, sceneState = null) {
-    const entries = getEntries(data);
-    // 1) FF4 VIR Rules (schema)
-    let schemaEntry = Object.values(entries).find(x => x?.comment === 'FF4 VIR Rules');
-    if (!schemaEntry) {
-        const uid = nextUid(data);
-        schemaEntry = makeEntry({
-            uid, key: ['FF4_VIR_RULES'], comment: 'FF4 VIR Rules',
-            content: schemaContent(), constant: true,
-            order: TIER.SCHEMA.order, depth: TIER.SCHEMA.depth, position: TIER.SCHEMA.position,
-        });
-        entries[uid] = schemaEntry;
-    } else {
-        schemaEntry.content = schemaContent();
-        schemaEntry.constant = true; schemaEntry.disable = false;
-        schemaEntry.order = TIER.SCHEMA.order; schemaEntry.depth = TIER.SCHEMA.depth;
-        schemaEntry.position = TIER.SCHEMA.position;
-    }
-    // 2) FF4 Pic Format Rules (optional; default OFF — preset has them too by default)
-    if (settings().usePicRules === true) {
-        let picEntry = Object.values(entries).find(x => x?.comment === 'FF4 Pic Format');
-        if (!picEntry) {
-            const uid = nextUid(data);
-            picEntry = makeEntry({
-                uid, key: ['FF4_PIC_FORMAT'], comment: 'FF4 Pic Format',
-                content: picRulesContent(), constant: true,
-                order: TIER.PIC_RULES.order, depth: TIER.PIC_RULES.depth, position: TIER.PIC_RULES.position,
-            });
-            entries[uid] = picEntry;
-        } else {
-            picEntry.content = picRulesContent();
-            picEntry.constant = true; picEntry.disable = false;
-            picEntry.order = TIER.PIC_RULES.order; picEntry.depth = TIER.PIC_RULES.depth;
-            picEntry.position = TIER.PIC_RULES.position;
-        }
-    } else {
-        // Settings says OFF — remove any auto-created FF4 Pic Format entry to avoid duplication with preset
-        for (const [uid, e] of Object.entries(entries)) {
-            if (e?.comment === 'FF4 Pic Format') delete entries[uid];
-        }
-    }
-    // 3) VIR_SCENE_INDEX
-    let sceneEntry = Object.values(entries).find(x => x?.comment === 'VIR_SCENE_INDEX');
-    if (!sceneEntry) {
-        const uid = nextUid(data);
-        sceneEntry = makeEntry({
-            uid, key: ['VIR_SCENE_INDEX'], comment: 'VIR_SCENE_INDEX',
-            content: sceneIndexContent(sceneState || {}), constant: true,
-            order: TIER.SCENE.order, depth: TIER.SCENE.depth, position: TIER.SCENE.position,
-        });
-        entries[uid] = sceneEntry;
-    } else if (sceneState) {
-        sceneEntry.content = sceneIndexContent(sceneState);
-        sceneEntry.constant = true; sceneEntry.disable = false;
-    }
-    // 4) VIR_ROSTER — one-line summary of every character so AI always knows who exists
-    rebuildRosterEntry(data);
-}
-
-function rebuildRosterEntry(data) {
-    const entries = getEntries(data);
-    const chars = characterEntries(data);
-    const lines = ['[VIR_ROSTER]'];
-    if (!chars.length) {
-        lines.push('No characters registered yet.');
-    } else {
-        const ledger = getLastActiveLedger(data);
-        const currentTurn = ledger.__currentTurn || 0;
-        for (const [, entry] of chars) {
-            const name = characterEntryName(entry); if (!name) continue;
-            const vir = parseActiveVir(entry.content);
-            const ident = compactValue([vir.species || vir.species_class, vir.source || vir.franchise, vir.age_appearance]);
-            const hairBrief = String(vir.hair || '').split(',')[0].trim().slice(0, 60);
-            const lastAt = ledger[name] || 0;
-            const ago = lastAt ? `last seen turn ${lastAt}${currentTurn > lastAt ? ` (${currentTurn - lastAt} ago)` : ''}` : 'not yet active';
-            lines.push(`- ${name}: ${ident}${hairBrief ? `; ${hairBrief}` : ''}; ${ago}`);
-        }
-    }
-    lines.push('[/VIR_ROSTER]');
-    lines.push('ROSTER USE: Every character above exists in this chat. If you reference any of them, their full [LOCKED VISUAL CARD] is already injected or will trigger on name mention. To pull back a character whose name has not appeared in recent turns, emit recall_characters in your vir_sync packet listing their canonical names.');
-    const content = lines.join('\n');
-    let rosterEntry = Object.values(entries).find(x => x?.comment === 'VIR_ROSTER');
-    if (!rosterEntry) {
-        const uid = nextUid(data);
-        rosterEntry = makeEntry({
-            uid, key: ['VIR_ROSTER'], comment: 'VIR_ROSTER',
-            content, constant: true,
-            order: TIER.ROSTER.order, depth: TIER.ROSTER.depth, position: TIER.ROSTER.position,
-        });
-        entries[uid] = rosterEntry;
-    } else {
-        rosterEntry.content = content;
-        rosterEntry.constant = true; rosterEntry.disable = false;
-        rosterEntry.order = TIER.ROSTER.order; rosterEntry.depth = TIER.ROSTER.depth;
-        rosterEntry.position = TIER.ROSTER.position;
-    }
-}
-
-const LEDGER_KEY = '__vir_last_active_ledger';
-
-function getLastActiveLedger(data) {
-    // Stored as a hidden entry in lorebook for persistence
-    const entries = getEntries(data);
-    const ledgerEntry = Object.values(entries).find(x => x?.comment === LEDGER_KEY);
-    if (!ledgerEntry) return {};
-    try { return JSON.parse(ledgerEntry.content || '{}'); } catch { return {}; }
-}
-
-function saveLastActiveLedger(data, ledger) {
-    const entries = getEntries(data);
-    let ledgerEntry = Object.values(entries).find(x => x?.comment === LEDGER_KEY);
-    if (!ledgerEntry) {
-        const uid = nextUid(data);
-        ledgerEntry = makeEntry({
-            uid, key: [LEDGER_KEY], comment: LEDGER_KEY,
-            content: JSON.stringify(ledger), constant: false,
-            order: 999, depth: 4, position: 0,
-        });
-        ledgerEntry.disable = true; // never inject into context
-        entries[uid] = ledgerEntry;
-    } else {
-        ledgerEntry.content = JSON.stringify(ledger);
-        ledgerEntry.disable = true;
-    }
-}
-
-function bumpLastActive(data, names) {
-    const ledger = getLastActiveLedger(data);
-    const context = getContext();
-    const currentTurn = (context?.chat?.length || 0);
-    ledger.__currentTurn = currentTurn;
-    for (const name of names) {
-        if (!name) continue;
-        ledger[name] = currentTurn;
-    }
-    saveLastActiveLedger(data, ledger);
-    return ledger;
-}
-
+// ============================================================================
+// CHARACTER ENTRY MANAGEMENT
+// ============================================================================
 function characterEntryName(entry) {
     const commentName = String(entry?.comment || '').replace(/^VIR:\s*/i, '').trim();
     if (commentName && commentName !== entry?.comment) return commentName;
     const m = String(entry?.content || '').match(/\[ACTIVE VIR:\s*([^\]]+)\]/i);
     return m?.[1]?.trim() || '';
 }
-
 function characterEntries(data) {
     return Object.entries(getEntries(data)).filter(([, entry]) => {
-        if (!entry || entry.comment === 'FF4 VIR Rules' || entry.comment === 'VIR_SCENE_INDEX') return false;
+        if (!entry || entry.comment === 'FF4 VIR Rules' || entry.comment === 'FF4 FF4_STATE' || entry.comment === 'FF4 VIR Roster') return false;
         return Boolean(characterEntryName(entry));
     });
 }
-
 function characterCount(data) { return characterEntries(data).length; }
-
 function findCharacterEntry(data, name) {
-    const entries = getEntries(data);
     const target = canonicalizeName(name).canonical.toLowerCase();
-    return Object.values(entries).find(entry => {
-        if (!entry || entry.comment === 'FF4 VIR Rules' || entry.comment === 'VIR_SCENE_INDEX') return false;
+    return Object.values(getEntries(data)).find(entry => {
+        if (!entry || entry.comment === 'FF4 VIR Rules') return false;
         const entryName = String(entry.comment || '').replace(/^VIR:\s*/i, '');
         if (canonicalizeName(entryName).canonical.toLowerCase() === target) return true;
         if (String(entry.content || '').toLowerCase().includes(`[active vir: ${target}]`)) return true;
@@ -989,83 +437,65 @@ function findCharacterEntry(data, name) {
     });
 }
 
-function expandKeysFromPayload(name, payload) {
-    // Add signature items / relationships / epithets as keys for keyword-trigger recall
-    const vir = payload?.vir || payload || {};
-    const expansions = [];
-    // Signature equipment / accessories
-    const allEquip = [...(Array.isArray(vir.equipment) ? vir.equipment : []), ...(Array.isArray(vir.accessories) ? vir.accessories : [])];
-    for (const item of allEquip) {
-        const t = typeof item === 'string' ? item : (item?.item_type || item?.type || item?.item || '');
-        const noun = String(t).match(/\b(staff|sword|bow|axe|dagger|wand|shield|spear|scythe|hammer|katana|rifle|gun|pistol|cane|whip|gauntlet)\b/i);
-        if (noun) expansions.push(`${name}'s ${noun[0].toLowerCase()}`, noun[0].toLowerCase());
-    }
-    // Source/franchise epithet
-    if (vir.source || vir.franchise) {
-        const src = String(vir.source || vir.franchise).trim();
-        if (src && src.length < 50) expansions.push(`${src} party`, `${src} character`);
-    }
-    // Hair-color epithet
-    const hairColor = extractColorToken(vir.hair);
-    if (hairColor) expansions.push(`${hairColor}-haired ${vir.species_class || vir.species || 'character'}`);
-    // Explicit user-supplied epithets
-    if (Array.isArray(payload?.epithets)) expansions.push(...payload.epithets);
-    return uniqueClean(expansions);
-}
-
-function upsertCharacter(data, name, payload, activeNames) {
+function upsertCharacter(data, name, payload) {
     if (!name || !payload) return null;
     const entries = getEntries(data);
     const nameInfo = canonicalizeName(name, payload);
     name = nameInfo.canonical;
     const aliases = uniqueClean([...(Array.isArray(payload.aliases) ? payload.aliases : []), ...nameInfo.aliases]);
     const vir = payload.vir || payload;
-    const expanded = expandKeysFromPayload(name, payload);
-    const key = [...new Set([name, ...aliases, ...expanded].filter(Boolean))];
+    const key = uniqueClean([name, ...aliases]);
     let entry = findCharacterEntry(data, name);
     if (!entry) {
         const uid = nextUid(data);
         entry = makeEntry({
             uid, key, comment: `VIR: ${name}`, content: characterContent(name, { vir }),
-            constant: activeNames.has(name),
-            order: TIER.ACTIVE.order, depth: TIER.ACTIVE.depth, position: TIER.ACTIVE.position,
+            constant: false,  // tier system applies actual constant flag
+            order: TIER.OFFSCREEN.order, depth: TIER.OFFSCREEN.depth, position: 4,
         });
         entries[uid] = entry;
     } else {
-        entry.key = [...new Set([...(entry.key || []), ...key])];
+        entry.key = uniqueClean([...(entry.key || []), ...key]);
         entry.comment = `VIR: ${name}`;
         entry.content = characterContent(name, { vir });
-        entry.constant = activeNames.has(name);
         entry.disable = false;
     }
     return entry;
 }
 
-function applyDelta(data, name, delta, activeNames) {
+function applyDelta(data, name, delta) {
     if (!name || !delta) return;
     name = canonicalizeName(name, delta).canonical;
     const current = findCharacterEntry(data, name);
     const oldVir = current ? parseActiveVir(current.content) : {};
-    return upsertCharacter(data, name, { vir: mergeVir(oldVir, delta) }, activeNames);
+    return upsertCharacter(data, name, { vir: mergeVir(oldVir, delta) });
 }
 
-function setActiveFlags(data, activeNames, pinnedNames = new Set(), keepAllConstant = false) {
+// ============================================================================
+// SMART TIER APPLICATION
+// ============================================================================
+function setActiveFlags(data, activeNames, pinnedNames = new Set(), recallNames = new Set()) {
+    const smart = settings().smartTiers !== false;
     for (const entry of Object.values(getEntries(data))) {
-        if (!entry || entry.comment === 'FF4 VIR Rules' || entry.comment === 'VIR_SCENE_INDEX') continue;
-        const name = characterEntryName(entry); if (!name) continue;
+        if (!entry || entry.comment === 'FF4 VIR Rules' || entry.comment === 'FF4 FF4_STATE' || entry.comment === 'FF4 VIR Roster') continue;
+        const name = characterEntryName(entry);
+        if (!name) continue;
         if (pinnedNames.has(name)) {
-            entry.constant = true; entry.order = TIER.PINNED.order;
-            entry.depth = TIER.PINNED.depth; entry.position = TIER.PINNED.position;
-        } else if (keepAllConstant || activeNames.has(name)) {
-            entry.constant = true; entry.order = TIER.ACTIVE.order;
-            entry.depth = TIER.ACTIVE.depth; entry.position = TIER.ACTIVE.position;
+            entry.constant = true; entry.order = TIER.PINNED.order; entry.depth = TIER.PINNED.depth;
+        } else if (activeNames.has(name)) {
+            entry.constant = true; entry.order = TIER.ACTIVE.order; entry.depth = TIER.ACTIVE.depth;
+        } else if (recallNames.has(name)) {
+            entry.constant = true; entry.order = TIER.RECALL.order; entry.depth = TIER.RECALL.depth;
         } else {
-            entry.constant = false; entry.order = TIER.OFFSCREEN.order;
-            entry.depth = TIER.OFFSCREEN.depth; entry.position = TIER.OFFSCREEN.position;
+            // OFFSCREEN — smart mode: keyword-only (no constant); else: behave like active
+            if (smart) {
+                entry.constant = false; entry.order = TIER.OFFSCREEN.order; entry.depth = TIER.OFFSCREEN.depth;
+            } else {
+                entry.constant = true; entry.order = TIER.ACTIVE.order; entry.depth = TIER.ACTIVE.depth;
+            }
         }
     }
 }
-
 function activeNamesFrom(sync) {
     const names = new Set();
     for (const name of Object.keys(sync.new_characters || {})) names.add(name);
@@ -1077,690 +507,86 @@ function activeNamesFrom(sync) {
     return names;
 }
 
-// ------------------------------------------------------------------
-// World load + save
-// ------------------------------------------------------------------
-async function ensureWorldLoaded(worldName) {
-    let data = await loadWorldInfo(worldName);
-    if (!data || typeof data !== 'object') data = { entries: {} };
-    getEntries(data);
-    ensureBaseEntries(data);
-    await saveWorldInfo(worldName, data, true);
-    await updateWorldInfoList();
-    return data;
-}
-
-async function activateCurrentWorld() {
-    if (!settings().enabled) return;
-    const worldName = currentWorldName();
-    if (!worldName) return;
-    await ensureWorldLoaded(worldName);
-    rememberWorldChat(worldName);
-
-    // (A) Add to globalSelect so it's loaded
-    const wiSettings = getWorldInfoSettings();
-    const active = Array.isArray(wiSettings.world_info?.globalSelect)
-        ? wiSettings.world_info.globalSelect : [];
-    const nextGlobal = [...active.filter(n => !isVirWorldName(n)), worldName];
-    updateWorldInfoSettings(wiSettings, [...new Set(nextGlobal)]);
-
-    // (B) Also bind to chat metadata for per-chat scoping (critical fix)
-    if (settings().bindToChat && typeof chat_metadata === 'object') {
-        if (chat_metadata[WI_METADATA_KEY] !== worldName) {
-            chat_metadata[WI_METADATA_KEY] = worldName;
-            try { await saveMetadata(); } catch (e) { warn('saveMetadata failed', e); }
-        }
-    }
-    updateStatus();
-}
-
-async function deleteVirWorld(worldName) {
-    if (!isVirWorldName(worldName)) return false;
-    const wiSettings = getWorldInfoSettings();
-    const active = Array.isArray(wiSettings.world_info?.globalSelect)
-        ? wiSettings.world_info.globalSelect : [];
-    updateWorldInfoSettings(wiSettings, active.filter(n => n !== worldName));
-    const deleted = await deleteWorldInfo(worldName);
-    if (deleted) { delete settings().worldChatMap?.[worldName]; saveSettingsDebounced(); }
-    return deleted;
-}
-
-async function cleanupVirForDeletedChat(chatId) {
-    if (!settings().cleanupOnChatDelete || !chatId) return;
-    const matches = matchingWorldsForChat(String(chatId));
-    if (!matches.length) return;
-    let deleted = 0;
-    for (const w of matches) if (await deleteVirWorld(w)) deleted++;
-    if (deleted) toastr.info(`Deleted ${deleted} VIR lorebook(s) for removed chat.`, 'FF4 VIR Sync');
-    await updateWorldInfoList(); updateStatus();
-}
-
-function deactivateVirWorlds() {
-    const wiSettings = getWorldInfoSettings();
-    const active = Array.isArray(wiSettings.world_info?.globalSelect)
-        ? wiSettings.world_info.globalSelect : [];
-    updateWorldInfoSettings(wiSettings, active.filter(n => !isVirWorldName(n)));
-    updateStatus();
-}
-
-// ------------------------------------------------------------------
-// Packet extraction (robust against HTML escaping)
-// ------------------------------------------------------------------
-function decodeEntities(text) {
-    return String(text || '')
-        .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
-        .replace(/&quot;/g, '"').replace(/&#39;/g, "'")
-        .replace(/&amp;/g, '&');
-}
-
-function extractPackets(text) {
-    const packets = [];
-    const seen = new Set();
-    const addPacket = (raw, body) => {
-        const bodyTrim = body.replace(/^```(?:json)?\s*/i, '').replace(/```$/i, '').trim();
-        const sig = hashString(bodyTrim);
-        if (seen.has(sig)) return;
-        seen.add(sig);
-        packets.push({ raw, body: bodyTrim, sig });
-    };
-
-    SYNC_RE.lastIndex = 0;
-    let m;
-    while ((m = SYNC_RE.exec(text)) !== null) addPacket(m[0], m[1]);
-
-    // Fall back to HTML-encoded form if nothing found in raw text
-    if (!packets.length) {
-        const decoded = decodeEntities(text);
-        SYNC_RE.lastIndex = 0;
-        while ((m = SYNC_RE.exec(decoded)) !== null) addPacket(m[0], m[1]);
-    }
-
-    // Also catch lone HTML-encoded packets inside messages that contain other unescaped HTML
-    SYNC_RE_ENCODED.lastIndex = 0;
-    while ((m = SYNC_RE_ENCODED.exec(text)) !== null) addPacket(m[0], decodeEntities(m[1]));
-
-    return packets;
-}
-
-function parsePacket(packet) {
-    let data;
-    try { data = JSON.parse(packet.body); }
-    catch (e) {
-        // Attempt brace-match recovery (trailing garbage / partial fence)
-        const start = packet.body.indexOf('{');
-        const end = packet.body.lastIndexOf('}');
-        if (start >= 0 && end > start) {
-            try { data = JSON.parse(packet.body.slice(start, end + 1)); }
-            catch (e2) { throw new Error('VIR sync packet JSON parse failed: ' + e.message); }
-        } else {
-            throw new Error('VIR sync packet has no JSON object: ' + e.message);
-        }
-    }
-    if (!data || typeof data !== 'object') throw new Error('VIR sync packet is not an object');
-    if (data.schema !== 1 && data.schema !== 2) throw new Error(`Unsupported VIR sync schema: ${data.schema}`);
-    return data;
-}
-
-// ------------------------------------------------------------------
-// Main sync flow
-// ------------------------------------------------------------------
-async function processSyncPacket(sync) {
-    const worldName = currentWorldName();
-    if (!worldName) throw new Error('No active chat id');
-    const normalized = normalizeSyncPacket(sync);
-    sync = normalized.sync;
-    const data = await ensureWorldLoaded(worldName);
-    const activeNames = activeNamesFrom(sync);
-    const existingSceneEntry = Object.values(getEntries(data)).find(x => x?.comment === 'VIR_SCENE_INDEX');
-    const existingScene = parseSceneState(existingSceneEntry);
-    const mergedScene = sync.scene_state ? mergeSceneState(existingScene, sync.scene_state) : existingScene;
-    const pinnedList = settings().pinnedCharacters?.[worldName] || [];
-    const pinnedNames = new Set(pinnedList);
-    const keepAllConstant = Boolean(settings().keepAllConstant);
-
-    // recall_characters: AI-declared bring-back list
-    const recallList = Array.isArray(sync.recall_characters) ? sync.recall_characters : [];
-    const turns = settings().recallTurnsDefault || 5;
-    const st = settings();
-    st.recallCharacters = st.recallCharacters || {};
-    st.recallCharacters[worldName] = st.recallCharacters[worldName] || {};
-    for (const rawName of recallList) {
-        const name = canonicalizeName(rawName).canonical;
-        if (name) st.recallCharacters[worldName][name] = turns;
-    }
-    saveSettingsDebounced();
-
-    ensureBaseEntries(data, mergedScene);
-    const upserted = [];
-    for (const [name, payload] of Object.entries(sync.new_characters || {})) {
-        const e = upsertCharacter(data, name, payload, activeNames);
-        if (e) upserted.push(characterEntryName(e));
-    }
-    for (const [name, delta] of Object.entries(sync.vir_delta || {})) {
-        const e = applyDelta(data, name, delta, activeNames);
-        if (e) upserted.push(characterEntryName(e));
-    }
-    // Build the recall-active set: anyone with remaining recall turns
-    const recallActive = new Set(Object.keys(st.recallCharacters[worldName] || {}));
-    const combinedActive = new Set([...activeNames, ...recallActive]);
-    setActiveFlags(data, combinedActive, pinnedNames, keepAllConstant);
-
-    // Schema v2 additions: char_state, geometry, relationships, aftermath_marks, vad, scene_id
-    if (sync.char_state && typeof sync.char_state === 'object') {
-        const existing = parseCharStateEntry(findCharStateEntry(data));
-        const merged = mergeCharState(existing, sync.char_state);
-        // Apply aftermath_marks (per-char window stamps)
-        if (sync.aftermath_marks && typeof sync.aftermath_marks === 'object') {
-            for (const [name, val] of Object.entries(sync.aftermath_marks)) {
-                merged[name] = merged[name] || {};
-                merged[name].aftermath = parseInt(val, 10) || st.aftermathWindowDefault || 3;
-            }
-        }
-        // Apply VAD updates
-        if (sync.vad && typeof sync.vad === 'object') {
-            for (const [name, vad] of Object.entries(sync.vad)) {
-                merged[name] = merged[name] || {};
-                merged[name].vad = { ...(merged[name].vad || {}), ...vad };
-            }
-        }
-        ensureCharStateEntry(data, merged);
-    } else if (sync.vad || sync.aftermath_marks) {
-        // VAD/aftermath without explicit char_state
-        const existing = parseCharStateEntry(findCharStateEntry(data));
-        const merged = { ...existing };
-        if (sync.vad) for (const [n, v] of Object.entries(sync.vad)) {
-            merged[n] = merged[n] || {};
-            merged[n].vad = { ...(merged[n].vad || {}), ...v };
-        }
-        if (sync.aftermath_marks) for (const [n, w] of Object.entries(sync.aftermath_marks)) {
-            merged[n] = merged[n] || {};
-            merged[n].aftermath = parseInt(w, 10) || st.aftermathWindowDefault || 3;
-        }
-        ensureCharStateEntry(data, merged);
-    }
-
-    if (sync.geometry && typeof sync.geometry === 'object') {
-        const geom = { ...sync.geometry };
-        if (!geom.scene_id) geom.scene_id = stampSceneId(worldName, mergedScene);
-        ensureGeometryEntry(data, geom);
-    } else if (mergedScene && mergedScene.location) {
-        // Auto-stamp scene_id from location change
-        stampSceneId(worldName, mergedScene);
-    }
-
-    if (sync.relationships && typeof sync.relationships === 'object') {
-        ensureRelationshipsEntry(data, sync.relationships);
-    }
-
-    // Refresh aggregated VOICE_LOCKS entry whenever VIR data changes
-    ensureVoiceLocksEntry(data);
-
-    // Update last-active ledger from this turn's active set
-    bumpLastActive(data, [...combinedActive, ...upserted]);
-    rebuildRosterEntry(data);
-    // Build unified FF4_STATE block last (reads all other entries)
-    ensureFF4StateEntry(data);
-
-    await saveWorldInfo(worldName, data, true);
-    await updateWorldInfoList();
-    await activateCurrentWorld();
-    return { worldName, warnings: normalized.warnings, upserted: uniqueClean(upserted), recalled: recallList };
-}
-
-// ---------- Pre-gen Somatic Lock injection (extension_prompts) ----------
-
-async function injectSomaticLockIfNeeded() {
-    const st = settings();
-    if (!st.somaticLockAutoDetect) return;
-    const context = getContext();
-    const chat = context?.chat || [];
-    // Look back for last user message
-    let lastUser = null;
-    for (let i = chat.length - 1; i >= 0; i--) {
-        if (chat[i].is_user) { lastUser = chat[i].mes || ''; break; }
-    }
-    if (!lastUser) return;
-    const hasAction = detectUserInputDeclaredAction(lastUser);
-    try {
-        const setExtensionPrompt = context.setExtensionPrompt || window.setExtensionPrompt;
-        if (typeof setExtensionPrompt !== 'function') return;
-        const key = 'FF4_VIR_SOMATIC';
-        if (!hasAction) {
-            setExtensionPrompt(key,
-                '[SOMATIC_LOCK ACTIVE] User input has no declared voluntary action. {{user}} body is FIXED — forbid voluntary motor for avatar. NPCs continue acting. {{user}} involuntary responses only (shiver/blush/flinch/breath/heartbeat/goosebumps).',
-                1, 0, false, 'system');
-        } else {
-            setExtensionPrompt(key, '', 1, 0);
-        }
-    } catch (e) { /* setExtensionPrompt may not be available in older ST */ }
-}
-
-async function processMessage(messageId) {
-    const context = getContext();
-    const message = context.chat?.[messageId];
-    if (!message || message.is_user) return;
-    const text = message.mes || '';
-    if (!text.includes('<vir_sync') && !text.includes('&lt;vir_sync')) return;
-
-    const packets = extractPackets(text);
-    if (!packets.length) return;
-
-    message.extra = message.extra || {};
-    message.extra[EXT] = message.extra[EXT] || {};
-    const processed = new Set(message.extra[EXT].processed || []);
-
-    const processedRaw = [];
-    const processedHashes = [];
-    const allWarnings = [];
-    const upsertedAll = new Set();
-    let lastWorldName = '';
-
-    try {
-        for (const packet of packets) {
-            // Dedup using both raw-string hash and body-signature hash
-            const rawHash = hashString(packet.raw);
-            if (processed.has(rawHash) || processed.has(packet.sig)) continue;
-
-            let sync;
-            try { sync = parsePacket(packet); }
-            catch (e) {
-                allWarnings.push(`Packet parse failed: ${e.message}`);
-                continue;
-            }
-            const preflight = normalizeSyncPacket(sync);
-            const quality = validateSyncPacket(preflight.sync);
-            if (quality.length) log('quality warnings', quality);
-            const result = await processSyncPacket(preflight.sync);
-            allWarnings.push(...preflight.warnings, ...quality, ...(result.warnings || []));
-            (result.upserted || []).forEach(n => upsertedAll.add(n));
-            lastWorldName = result.worldName;
-            processedRaw.push(packet.raw);
-            processedHashes.push(rawHash, packet.sig);
-            sessionPacketCount++;
-        }
-        if (!processedRaw.length && !allWarnings.length) return;
-
-        // Mark processed BEFORE auto-hide (so a failure inside auto-hide doesn't lose state)
-        message.extra[EXT].processed = [...new Set([
-            ...(message.extra[EXT].processed || []),
-            ...processedHashes,
-        ])];
-
-        if (settings().autoHideSyncedPackets && processedRaw.length) {
-            let updated = message.mes;
-            for (const raw of processedRaw) updated = updated.replace(raw, '');
-            updated = updated.replace(/\n{3,}/g, '\n\n').trim();
-            message.mes = updated;
-            updateMessageBlock(messageId, message);
-        }
-        await context.saveChat();
-
-        const uniqueWarnings = uniqueClean(allWarnings);
-        const upsertedList = [...upsertedAll];
-        const upsertNote = upsertedList.length ? ` (${upsertedList.join(', ')})` : '';
-        const msg = `Synced ${processedRaw.length} VIR packet(s)${lastWorldName ? ` to ${lastWorldName}` : ''}${upsertNote}. ${uniqueWarnings.length ? `${uniqueWarnings.length} warning(s).` : 'No warnings.'}`;
-        settings().sessionPacketCount = sessionPacketCount;
-        settings().lastError = '';
-        noteSyncStatus(msg, uniqueWarnings);
-
-        if (uniqueWarnings.length) toastr.warning(`VIR synced with ${uniqueWarnings.length} quality warning(s). Check extension panel.`, 'FF4 VIR Sync');
-        else toastInfo(`Synced ${processedRaw.length} VIR packet(s).`);
-        await renderCharacterList();
-    } catch (e) {
-        error('sync failed', e);
-        noteSyncStatus(`VIR sync failed: ${e.message}`, [], true);
-        toastr.warning(`VIR sync failed: ${e.message}`, 'FF4 VIR Sync');
-    }
-}
-
-async function handleMessage(messageId) {
-    if (!settings().enabled) return;
-    // Serialize all processing through a single queue to prevent race between
-    // MESSAGE_RECEIVED and CHARACTER_MESSAGE_RENDERED firing on the same id.
-    processingQueue = processingQueue.then(() => processMessage(messageId)).catch(e => error('queue', e));
-    processingQueue = processingQueue.then(() => decayRecall()).catch(e => error('decay', e));
-    processingQueue = processingQueue.then(() => decayCharStates()).catch(e => error('charstate-decay', e));
-    processingQueue = processingQueue.then(() => runWatchdogs(messageId)).catch(e => error('watchdogs', e));
-    processingQueue = processingQueue.then(() => modeSyncInject()).catch(e => error('mode-sync', e));
-    processingQueue = processingQueue.then(() => injectWorldTexture()).catch(e => error('world-texture', e));
-    if (settings().picTagVerify && settings().picTagVerify !== 'off') {
-        processingQueue = processingQueue.then(() => verifyPicTags(messageId)).catch(e => error('pic verify', e));
-    }
-}
-
-// ====================================================================
-// PEAK v3 — Watchdogs, FF4_STATE builder, CHAR_STATE machine, schema v2
-// ====================================================================
-
-function currentChatTurn() {
-    return getContext()?.chat?.length || 0;
-}
-
-// ---------- CHAR_STATE machine (per-character mutable state ledger) ----------
-
-function charStateContent(stateMap) {
-    if (!stateMap || !Object.keys(stateMap).length) return '';
-    const lines = ['[CHAR_STATE]'];
-    for (const [name, s] of Object.entries(stateMap)) {
-        if (!s || typeof s !== 'object') continue;
-        const parts = [name];
-        if (s.outfit_layers) parts.push(`outfit:${s.outfit_layers}`);
-        if (s.hair_state) parts.push(`hair:${s.hair_state}`);
-        if (s.body_fluids) parts.push(`fluids:${s.body_fluids}`);
-        if (s.injuries) parts.push(`injuries:${s.injuries}`);
-        if (s.accessory_state) parts.push(`acc:${s.accessory_state}`);
-        if (s.held) parts.push(`held:${s.held}`);
-        if (s.vad) parts.push(`vad:V${s.vad.V ?? 0}/A${s.vad.A ?? 0}/D${s.vad.D ?? 0}`);
-        if (s.register) parts.push(`reg:${s.register}`);
-        if (s.aftermath > 0) parts.push(`aftermath:${s.aftermath}`);
-        lines.push(parts.join(' | '));
-    }
-    lines.push('[/CHAR_STATE]');
-    return lines.join('\n');
-}
-
-function parseCharStateEntry(entry) {
-    if (!entry) return {};
-    const m = String(entry.content || '').match(/\[CHAR_STATE\]([\s\S]*?)\[\/CHAR_STATE\]/);
-    if (!m) return {};
-    const out = {};
-    for (const line of m[1].split('\n')) {
-        const t = line.trim();
-        if (!t) continue;
-        const parts = t.split(' | ');
-        const name = parts[0];
-        if (!name) continue;
-        const s = {};
-        for (const p of parts.slice(1)) {
-            const idx = p.indexOf(':');
-            if (idx < 0) continue;
-            const k = p.slice(0, idx);
-            const v = p.slice(idx + 1);
-            if (k === 'outfit') s.outfit_layers = v;
-            else if (k === 'hair') s.hair_state = v;
-            else if (k === 'fluids') s.body_fluids = v;
-            else if (k === 'injuries') s.injuries = v;
-            else if (k === 'acc') s.accessory_state = v;
-            else if (k === 'held') s.held = v;
-            else if (k === 'reg') s.register = v;
-            else if (k === 'vad') {
-                const vm = v.match(/V([+-]?\d+)\/A([+-]?\d+)\/D([+-]?\d+)/);
-                if (vm) s.vad = { V: +vm[1], A: +vm[2], D: +vm[3] };
-            } else if (k === 'aftermath') s.aftermath = parseInt(v, 10) || 0;
-        }
-        out[name] = s;
-    }
-    return out;
-}
-
-function findCharStateEntry(data) {
-    return Object.values(getEntries(data)).find(e => e?.comment === 'FF4 CHAR_STATE');
-}
-
-function ensureCharStateEntry(data, stateMap) {
-    const entries = getEntries(data);
-    let entry = findCharStateEntry(data);
-    const content = charStateContent(stateMap || {});
-    if (!entry) {
-        if (!content) return null;
-        const uid = nextUid(data);
-        entry = makeEntry({
-            uid, key: ['CHAR_STATE'], comment: 'FF4 CHAR_STATE',
-            content, constant: true,
-            order: 46, depth: 1, position: 0,
-        });
-        entries[uid] = entry;
-    } else if (content) {
-        entry.content = content;
-    } else {
-        delete entries[entry.uid];
-    }
-    return entry;
-}
-
-function mergeCharState(existing, incoming) {
-    const out = { ...(existing || {}) };
-    for (const [name, s] of Object.entries(incoming || {})) {
-        if (!s) continue;
-        out[name] = { ...(out[name] || {}), ...s };
-        // VAD deep-merge
-        if (s.vad && out[name].vad) {
-            out[name].vad = { ...out[name].vad, ...s.vad };
-        }
-    }
-    return out;
-}
-
-async function decayCharStates() {
-    if (!settings().enabled) return;
-    const worldName = currentWorldName();
-    if (!worldName) return;
-    const data = await loadWorldInfo(worldName);
-    if (!data) return;
-    const entry = findCharStateEntry(data);
-    if (!entry) return;
-    const stateMap = parseCharStateEntry(entry);
-    let changed = false;
-    for (const name of Object.keys(stateMap)) {
-        const s = stateMap[name];
-        if (s.aftermath > 0) {
-            s.aftermath--;
-            if (s.aftermath === 0) delete s.aftermath;
-            changed = true;
-        }
-    }
-    if (changed) {
-        ensureCharStateEntry(data, stateMap);
-        await saveWorldInfo(worldName, data, true);
-    }
-}
-
-// ---------- Scene Geometry entry ----------
-
-function sceneGeometryContent(geom) {
-    if (!geom || !Object.keys(geom).length) return '';
-    const lines = ['[SCENE_GEOMETRY]'];
-    if (geom.scene_id) lines.push(`scene_id:${geom.scene_id}`);
-    if (geom.positions) {
-        for (const [name, pos] of Object.entries(geom.positions)) {
-            lines.push(`${name}:${pos}`);
-        }
-    }
-    if (geom.contacts && Array.isArray(geom.contacts)) {
-        for (const c of geom.contacts) lines.push(`contact:${c}`);
-    }
-    lines.push('[/SCENE_GEOMETRY]');
-    return lines.join('\n');
-}
-
-function findGeometryEntry(data) {
-    return Object.values(getEntries(data)).find(e => e?.comment === 'FF4 SCENE_GEOMETRY');
-}
-
-function ensureGeometryEntry(data, geom) {
-    const entries = getEntries(data);
-    let entry = findGeometryEntry(data);
-    const content = sceneGeometryContent(geom);
-    if (!entry) {
-        if (!content) return null;
-        const uid = nextUid(data);
-        entry = makeEntry({
-            uid, key: ['SCENE_GEOMETRY'], comment: 'FF4 SCENE_GEOMETRY',
-            content, constant: true, order: 47, depth: 1, position: 0,
-        });
-        entries[uid] = entry;
-    } else if (content) {
-        entry.content = content;
-    } else {
-        delete entries[entry.uid];
-    }
-    return entry;
-}
-
-// ---------- Relationships entry ----------
-
-function relationshipsContent(rels) {
-    if (!rels || !Object.keys(rels).length) return '';
-    const lines = ['[RELATIONSHIPS]'];
-    for (const [pair, info] of Object.entries(rels)) {
-        if (!info) continue;
-        if (typeof info === 'string') {
-            lines.push(`${pair}: ${info}`);
-        } else {
-            const bits = [];
-            if (info.status) bits.push(`status=${info.status}`);
-            if (info.tension) bits.push(`tension=${info.tension}`);
-            if (info.notes) bits.push(`notes="${info.notes}"`);
-            lines.push(`${pair}: ${bits.join(' | ')}`);
-        }
-    }
-    lines.push('[/RELATIONSHIPS]');
-    return lines.join('\n');
-}
-
-function findRelationshipsEntry(data) {
-    return Object.values(getEntries(data)).find(e => e?.comment === 'FF4 RELATIONSHIPS');
-}
-
-function ensureRelationshipsEntry(data, rels) {
-    const entries = getEntries(data);
-    let entry = findRelationshipsEntry(data);
-    const content = relationshipsContent(rels);
-    if (!entry) {
-        if (!content) return null;
-        const uid = nextUid(data);
-        entry = makeEntry({
-            uid, key: ['RELATIONSHIPS'], comment: 'FF4 RELATIONSHIPS',
-            content, constant: true, order: 48, depth: 1, position: 0,
-        });
-        entries[uid] = entry;
-    } else if (content) {
-        entry.content = content;
-    } else {
-        delete entries[entry.uid];
-    }
-    return entry;
-}
-
-// ---------- VOICE_LOCKS aggregated entry ----------
-
-function voiceLockSummary(name, vl) {
-    if (!vl || typeof vl !== 'object') return null;
-    const bits = [];
-    if (vl.vocab_tier) bits.push(`vocab=${vl.vocab_tier}`);
-    if (vl.profanity) bits.push(`profanity=${vl.profanity}`);
-    if (vl.formality) bits.push(`formality=${vl.formality}`);
-    if (vl.accent) bits.push(`accent=${vl.accent}`);
-    if (vl.gender) bits.push(`gender=${vl.gender}`);
-    if (vl.stutter || vl.tic) bits.push(`tic=${vl.stutter || vl.tic}`);
-    if (vl.signature_phrases) {
-        const sig = Array.isArray(vl.signature_phrases) ? vl.signature_phrases.join(' / ') : vl.signature_phrases;
-        bits.push(`signature=[${sig}]`);
-    }
-    if (vl.female_acoustics_enforce !== false && vl.gender === 'female') bits.push('female_acoustics=on');
-    if (!bits.length) return null;
-    return `${name}: ${bits.join(', ')}`;
-}
-
-function voiceLocksContent(charsWithVoice) {
-    if (!charsWithVoice || !charsWithVoice.length) return '';
-    const lines = ['[VOICE_LOCKS]'];
-    for (const [name, vl] of charsWithVoice) {
-        const s = voiceLockSummary(name, vl);
-        if (s) lines.push(s);
-    }
-    lines.push('[/VOICE_LOCKS]');
-    return lines.length > 2 ? lines.join('\n') : '';
-}
-
-function findVoiceLocksEntry(data) {
-    return Object.values(getEntries(data)).find(e => e?.comment === 'FF4 VOICE_LOCKS');
-}
-
-function ensureVoiceLocksEntry(data) {
-    const entries = getEntries(data);
+// ============================================================================
+// DIALOGUE COLOR AUTO-ASSIGNMENT (palette, light/bright only for dark theme)
+// ============================================================================
+function assignDialogueColors(data) {
     const chars = characterEntries(data);
-    const charsWithVoice = [];
+    const used = new Set();
+    const queue = [];
     for (const [, entry] of chars) {
         const name = characterEntryName(entry);
         if (!name) continue;
         const vir = parseActiveVir(entry.content || '');
-        if (vir?.voice_lock) charsWithVoice.push([name, vir.voice_lock]);
+        if (vir?.voice_lock?.dialogue_color) used.add(String(vir.voice_lock.dialogue_color).toUpperCase());
+        else queue.push({ entry, name, vir });
     }
-    let entry = findVoiceLocksEntry(data);
-    const content = voiceLocksContent(charsWithVoice);
-    if (!entry) {
-        if (!content) return null;
-        const uid = nextUid(data);
-        entry = makeEntry({
-            uid, key: ['VOICE_LOCKS'], comment: 'FF4 VOICE_LOCKS',
-            content, constant: true, order: 49, depth: 1, position: 0,
-        });
-        entries[uid] = entry;
-    } else if (content) {
-        entry.content = content;
-    } else {
-        delete entries[entry.uid];
+    let changed = false;
+    for (const { entry, name, vir } of queue) {
+        const available = DIALOGUE_PALETTE.find(c => !used.has(c.toUpperCase()));
+        const color = available || DIALOGUE_PALETTE[Math.floor(Math.random() * DIALOGUE_PALETTE.length)];
+        used.add(color.toUpperCase());
+        if (!vir.voice_lock) vir.voice_lock = {};
+        vir.voice_lock.dialogue_color = color;
+        entry.content = characterContent(name, { vir });
+        changed = true;
     }
-    return entry;
+    return changed;
 }
 
-// ---------- FF4_STATE unified ephemeral block ----------
-
+// ============================================================================
+// FF4_STATE unified entry (replaces 4 separate state entries from v4)
+// ============================================================================
 function buildFF4StateContent(data) {
-    const st = settings();
     const worldName = currentWorldName();
     if (!worldName) return '';
-    const turn = currentChatTurn();
-    const sceneEntry = Object.values(getEntries(data)).find(e => e?.comment === 'VIR_SCENE_INDEX');
+    const sceneEntry = Object.values(getEntries(data)).find(e => e?.comment === 'FF4 SCENE_STATE');
     const scene = parseSceneState(sceneEntry);
-    const stateEntry = findCharStateEntry(data);
-    const stateMap = parseCharStateEntry(stateEntry);
-    const geomEntry = findGeometryEntry(data);
-    const sceneId = st.sceneIds?.[worldName]?.currentId || '';
-    const lines = [`[FF4_STATE turn=${turn}]`];
-    if (sceneId) lines.push(`scene_id=${sceneId}`);
-    if (scene.location) lines.push(`location=${scene.location}`);
-    if (scene.time) lines.push(`time=${scene.time}`);
-    if (scene.weather) lines.push(`weather=${scene.weather}`);
+    const lines = ['[FF4_STATE]'];
+    if (scene.location) lines.push(`location: ${scene.location}`);
+    if (scene.time) lines.push(`time: ${scene.time}`);
+    if (scene.weather) lines.push(`weather: ${scene.weather}`);
     const active = Array.isArray(scene.active_characters) ? scene.active_characters : [];
-    if (active.length) {
-        const bits = active.map(n => {
-            const s = stateMap[n] || {};
-            const tags = [];
-            if (s.vad) tags.push(`V${s.vad.V}/A${s.vad.A}/D${s.vad.D}`);
-            if (s.aftermath > 0) tags.push(`sore${s.aftermath}`);
-            if (s.register) tags.push(s.register);
-            return tags.length ? `${n}(${tags.join(',')})` : n;
-        });
-        lines.push(`active=${bits.join(', ')}`);
+    if (active.length) lines.push(`active: ${active.join(', ')}`);
+    // Per-char state
+    if (scene.characters) {
+        const stateBits = [];
+        for (const [n, s] of Object.entries(scene.characters)) {
+            if (!s) continue;
+            const parts = [];
+            if (s.outfit_state) parts.push(`outfit:${s.outfit_state}`);
+            if (s.hair_state) parts.push(`hair:${s.hair_state}`);
+            if (s.body_fluids) parts.push(`fluids:${s.body_fluids}`);
+            if (s.injuries) parts.push(`inj:${s.injuries}`);
+            if (s.aftermath) parts.push(`aftermath:${s.aftermath}`);
+            if (s.position) parts.push(`pos:${s.position}`);
+            if (parts.length) stateBits.push(`  ${n}: ${parts.join(' | ')}`);
+        }
+        if (stateBits.length) lines.push('char_state:'); lines.push(...stateBits);
     }
-    // Recent reply shapes
-    const shapes = (st.shapeHistory?.[worldName] || []).slice(-2);
-    if (shapes.length) lines.push(`recent_shapes=${shapes.join(',')}`);
-    // Recent banned vocab hits
-    const hits = (st.bannedVocabHits?.[worldName] || []).slice(-3);
-    if (hits.length) lines.push(`recent_banned_vocab_hits=${hits.map(h => h.term).join(', ')} -- AVOID NEXT TURN`);
-    // Recent drift warnings
-    const drifts = (st.driftWarnings?.[worldName] || []).slice(-3);
-    if (drifts.length) {
-        const summary = drifts.map(d => `${d.char}(missing:${d.missing.join('/')})`).join('; ');
-        lines.push(`recent_drift=${summary} -- RESTORE VERBATIM NEXT PIC`);
+    // Dialogue colors for active chars only
+    const colorBits = [];
+    for (const [, entry] of characterEntries(data)) {
+        const name = characterEntryName(entry);
+        if (!name || !active.includes(name)) continue;
+        const vir = parseActiveVir(entry.content || '');
+        const color = vir?.voice_lock?.dialogue_color;
+        if (color) colorBits.push(`${name}=${color}`);
     }
-    // Aftermath active hint
-    const aftermathChars = Object.entries(stateMap).filter(([, s]) => s.aftermath > 0).map(([n, s]) => `${n}=${s.aftermath}t`);
-    if (aftermathChars.length) lines.push(`aftermath_active=${aftermathChars.join(',')} -- pics carry marks/soreness/fluids`);
-    // Agency mode
-    if (st.agencyMode && st.agencyMode !== 'auto') lines.push(`agency=${st.agencyMode}`);
-    // Tension rung (from char_state if tracked, else from PM history would be needed)
+    if (colorBits.length) lines.push(`dialogue_colors: ${colorBits.join(', ')}`);
+    // Recall info
+    const st = settings();
+    const recall = st.recallCharacters?.[worldName];
+    if (recall && Object.keys(recall).length) {
+        const recallBits = Object.entries(recall).map(([n, t]) => `${n}(${t}t)`);
+        lines.push(`recall: ${recallBits.join(', ')}`);
+    }
     lines.push('[/FF4_STATE]');
     return lines.join('\n');
 }
-
 function findFF4StateEntry(data) {
     return Object.values(getEntries(data)).find(e => e?.comment === 'FF4 FF4_STATE');
 }
-
 function ensureFF4StateEntry(data) {
     const entries = getEntries(data);
     let entry = findFF4StateEntry(data);
@@ -1768,10 +594,7 @@ function ensureFF4StateEntry(data) {
     if (!entry) {
         if (!content) return null;
         const uid = nextUid(data);
-        entry = makeEntry({
-            uid, key: ['FF4_STATE'], comment: 'FF4 FF4_STATE',
-            content, constant: true, order: 41, depth: 1, position: 0,
-        });
+        entry = makeEntry({ uid, key: ['FF4_STATE'], comment: 'FF4 FF4_STATE', content, constant: true, order: 41, depth: 1, position: 0 });
         entries[uid] = entry;
     } else if (content) {
         entry.content = content;
@@ -1781,630 +604,747 @@ function ensureFF4StateEntry(data) {
     return entry;
 }
 
-// ---------- Watchdogs (regex-based, low-overhead) ----------
-
-function detectReplyShape(text) {
-    if (!text) return null;
-    const trimmed = String(text).trim();
-    const firstLine = trimmed.split('\n').find(l => l.trim()) || '';
-    const opensWithDialogue = /^[\s>"*]*["“'][^"]/.test(firstLine) || /^[*_]?"[A-Z]/.test(firstLine);
-    const length = trimmed.length;
-    if (opensWithDialogue) return 'dialogue';
-    if (length > 2000) return 'dense';
-    if (length < 600) return 'sparse';
-    return 'action';
+// Scene state — single entry, merged not replaced
+function sceneStateContent(scene) {
+    if (!scene || !Object.keys(scene).length) return '';
+    return `[FF4_SCENE_STATE]\n${JSON.stringify(scene)}\n[/FF4_SCENE_STATE]`;
 }
-
-function detectBannedVocabHits(text, list) {
-    if (!text) return [];
-    const hits = [];
-    for (const term of list || []) {
-        const re = new RegExp(`\\b${term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
-        if (re.test(text)) hits.push(term);
+function parseSceneState(entry) {
+    if (!entry) return {};
+    const m = String(entry.content || '').match(/\[FF4_SCENE_STATE\]([\s\S]*?)\[\/FF4_SCENE_STATE\]/);
+    if (!m) return {};
+    try { return JSON.parse(m[1].trim()); } catch { return {}; }
+}
+function ensureSceneStateEntry(data, scene) {
+    const entries = getEntries(data);
+    let entry = Object.values(entries).find(e => e?.comment === 'FF4 SCENE_STATE');
+    const content = sceneStateContent(scene);
+    if (!entry) {
+        if (!content) return null;
+        const uid = nextUid(data);
+        entry = makeEntry({ uid, key: ['SCENE_STATE'], comment: 'FF4 SCENE_STATE', content, constant: false, disable: true, order: 42, depth: 1, position: 0 });
+        entries[uid] = entry;
+    } else if (content) {
+        entry.content = content;
+        entry.disable = true;
     }
-    return hits;
+    return entry;
 }
-
-function detectFemaleAcousticViolations(text, femaleNames) {
-    if (!text || !femaleNames?.length) return [];
-    const violations = [];
-    for (const name of femaleNames) {
-        const escName = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        // Look for "<name>'s low/deep/husky voice" or similar within 60 chars
-        const ctxRe = new RegExp(`${escName}[^.]{0,60}\\b(low|deep|husky|throaty|gravelly)\\s+(voice|tone|murmur|whisper|growl|moan)`, 'i');
-        if (ctxRe.test(text)) violations.push(name);
-    }
-    return violations;
-}
-
-function detectMacroEmotion(text) {
-    if (!text) return [];
-    const matches = [];
-    const re = new RegExp(MACRO_EMOTION_RE.source, 'gi');
-    let m;
-    while ((m = re.exec(text)) !== null && matches.length < 5) {
-        matches.push(m[0]);
-    }
-    return matches;
-}
-
-function detectUserInputDeclaredAction(userText) {
-    if (!userText) return false;
-    return DECLARED_ACTION_RE.test(userText);
-}
-
-function extractPicCharacterParagraphs(text) {
-    if (!text) return [];
-    const out = [];
-    PIC_TAG_RE.lastIndex = 0;
-    let m;
-    while ((m = PIC_TAG_RE.exec(text)) !== null) {
-        const attrs = m[1];
-        const pm = attrs.match(PIC_PROMPT_RE);
-        if (pm) out.push({ raw: m[0], attrs, prompt: pm[1] });
+function mergeSceneState(existing, incoming) {
+    const out = { ...(existing || {}) };
+    for (const [k, v] of Object.entries(incoming || {})) {
+        if (k === 'characters') {
+            out.characters = { ...(out.characters || {}) };
+            for (const [name, state] of Object.entries(v || {})) {
+                out.characters[name] = { ...(out.characters[name] || {}), ...state };
+            }
+        } else if (v !== undefined && v !== null) {
+            out[k] = v;
+        }
     }
     return out;
 }
 
-function canonicalTokensFromVir(vir) {
-    const tokens = [];
-    const fields = ['hair', 'eyes', 'skin_fur_scales', 'body', 'marks'];
-    for (const f of fields) {
-        const v = vir?.[f];
-        if (!v) continue;
-        const text = typeof v === 'string' ? v : (v?.text || '');
-        // Extract color/length/material tokens — words longer than 4 chars that aren't generic
-        const words = text.match(/\b[a-z]{4,}(?:[- ][a-z]{4,})*\b/gi) || [];
-        for (const w of words) {
-            const lw = w.toLowerCase();
-            if (['hair', 'eyes', 'skin', 'body', 'long', 'short', 'medium', 'with', 'and', 'the', 'a', 'an', 'her', 'his'].includes(lw)) continue;
-            tokens.push(lw);
-        }
+// ============================================================================
+// VIR ROSTER (always-on compact reference of all known chars)
+// ============================================================================
+function buildRosterContent(data) {
+    const chars = characterEntries(data);
+    if (!chars.length) return '';
+    const lines = ['[VIR_ROSTER]'];
+    for (const [, entry] of chars) {
+        const name = characterEntryName(entry);
+        if (!name) continue;
+        const vir = parseActiveVir(entry.content || '');
+        const id = [vir.species, vir.source].filter(Boolean).join('/');
+        const hairBrief = vir.hair ? String(vir.hair).split(',')[0].slice(0, 40) : '';
+        lines.push(`- ${name}${id ? `: ${id}` : ''}${hairBrief ? `; ${hairBrief}` : ''}`);
     }
-    return [...new Set(tokens)];
+    lines.push('USE: emit recall_characters:["Name"] to re-activate a long-absent char.');
+    lines.push('[/VIR_ROSTER]');
+    return lines.join('\n');
+}
+function findRosterEntry(data) {
+    return Object.values(getEntries(data)).find(e => e?.comment === 'FF4 VIR Roster');
+}
+function rebuildRosterEntry(data) {
+    const entries = getEntries(data);
+    let entry = findRosterEntry(data);
+    const content = buildRosterContent(data);
+    if (!entry) {
+        if (!content) return null;
+        const uid = nextUid(data);
+        entry = makeEntry({ uid, key: ['VIR_ROSTER'], comment: 'FF4 VIR Roster', content, constant: true, order: 43, depth: 1, position: 0 });
+        entries[uid] = entry;
+    } else if (content) {
+        entry.content = content;
+    } else {
+        delete entries[entry.uid];
+    }
+    return entry;
 }
 
-function detectPicDrift(text, activeChars) {
-    if (!text || !activeChars?.length) return [];
-    const drifts = [];
-    const pics = extractPicCharacterParagraphs(text);
-    for (const pic of pics) {
-        const lcPrompt = pic.prompt.toLowerCase();
-        for (const { name, vir } of activeChars) {
-            if (!lcPrompt.includes(name.toLowerCase())) continue;
-            const canonical = canonicalTokensFromVir(vir);
-            if (canonical.length < 2) continue;
-            const missing = canonical.filter(tok => !lcPrompt.includes(tok));
-            // Drift = dropped >50% of canonical tokens or >=3 tokens missing
-            if (missing.length >= Math.max(2, Math.floor(canonical.length * 0.5))) {
-                drifts.push({ char: name, missing: missing.slice(0, 5), pic: pic.raw });
+// ============================================================================
+// SCHEMA RULES entry (small reference card always-on)
+// ============================================================================
+function schemaContent() {
+    return `<ff4_vir_lorebook_rules>
+SOURCE OF TRUTH: lorebook [ACTIVE VIR] / [LOCKED VISUAL CARD] / [FF4_STATE] / [VIR_ROSTER] entries for THIS chat only.
+COPY locked-card lines VERBATIM into every <pic>. Never paraphrase. Never resize.
+NEW CHAR: emit new_characters in vir_sync with full locked fields.
+LOCKED CHANGE: emit vir_delta with ONLY changed fields.
+MUTABLE STATE: emit scene_state.characters[name] only — never vir_delta.
+RECALL: char absent 10+ turns → emit recall_characters:["Name"].
+DIALOGUE COLOR: wrap each char's spoken lines in <font color='HEX'>"..."</font> using their VIR.voice_lock.dialogue_color (see [FF4_STATE].dialogue_colors map).
+</ff4_vir_lorebook_rules>`;
+}
+function ensureSchemaEntry(data) {
+    const entries = getEntries(data);
+    let entry = Object.values(entries).find(e => e?.comment === 'FF4 VIR Rules');
+    if (!entry) {
+        const uid = nextUid(data);
+        entry = makeEntry({ uid, key: ['VIR Rules'], comment: 'FF4 VIR Rules', content: schemaContent(), constant: true, order: 40, depth: 1, position: 0 });
+        entries[uid] = entry;
+    } else {
+        entry.content = schemaContent();
+    }
+    return entry;
+}
+
+// ============================================================================
+// PACKET PARSING — code-fence-aware, truncation-tolerant
+// ============================================================================
+function maskCodeFences(text) {
+    return text.replace(/```\w*[\s\S]*?```/g, m => ' '.repeat(m.length));
+}
+function findOrphanSyncBlocks(text) {
+    if (!text) return [];
+    const results = [];
+    let cursor = 0;
+    const OPEN_RE = /\{\s*"schema"\s*:\s*[12]\s*,/g;
+    while (true) {
+        OPEN_RE.lastIndex = cursor;
+        const open = OPEN_RE.exec(text);
+        if (!open) break;
+        const start = open.index;
+        let depth = 0, inStr = false, escape = false, end = -1;
+        for (let j = start; j < text.length; j++) {
+            const ch = text[j];
+            if (escape) { escape = false; continue; }
+            if (ch === '\\') { escape = true; continue; }
+            if (ch === '"') { inStr = !inStr; continue; }
+            if (inStr) continue;
+            if (ch === '{') depth++;
+            else if (ch === '}') { depth--; if (depth === 0) { end = j + 1; break; } }
+        }
+        if (end === -1) break;
+        const blob = text.slice(start, end);
+        if (/"(?:new_characters|vir_delta|scene_state|char_state)"/.test(blob)) {
+            results.push({ start, end, text: blob });
+        }
+        cursor = end;
+    }
+    return results;
+}
+function decodeEntities(text) {
+    return String(text || '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&');
+}
+function extractPackets(text) {
+    const packets = [];
+    const seen = new Set();
+    const addPacket = (raw, body) => {
+        const bodyTrim = body.replace(/^```(?:json|vir)?\s*/i, '').replace(/```$/i, '').trim();
+        const sig = hashString(bodyTrim);
+        if (seen.has(sig)) return;
+        seen.add(sig);
+        packets.push({ raw, body: bodyTrim, sig });
+    };
+    // Primary: ```vir code fence
+    SYNC_RE_FENCE.lastIndex = 0;
+    let m;
+    while ((m = SYNC_RE_FENCE.exec(text)) !== null) addPacket(m[0], m[1]);
+    // Truncated ```vir without closing fence
+    if (!packets.length) {
+        const openMatch = text.match(/```vir\b\s*\n?([\s\S]+)$/i);
+        if (openMatch && openMatch[1].includes('"schema"')) addPacket(openMatch[0], openMatch[1]);
+    }
+    // Legacy <vir_sync> XML
+    SYNC_RE_XML.lastIndex = 0;
+    while ((m = SYNC_RE_XML.exec(text)) !== null) addPacket(m[0], m[1]);
+    // HTML-encoded
+    if (!packets.length) {
+        const decoded = decodeEntities(text);
+        SYNC_RE_XML.lastIndex = 0;
+        while ((m = SYNC_RE_XML.exec(decoded)) !== null) addPacket(m[0], m[1]);
+    }
+    // Orphan JSON via brace walker (tail only)
+    if (!packets.length) {
+        const tail = text.length > TAIL_SCAN_CHARS ? text.slice(-TAIL_SCAN_CHARS) : text;
+        for (const blob of findOrphanSyncBlocks(tail)) addPacket(blob.text, blob.text);
+    }
+    return packets;
+}
+// Robust 4-pass JSON parser, ported from RPG HUD's robustJsonParse.
+// Recovers from common AI emission errors:
+//   Pass 1: strict JSON.parse
+//   Pass 2: strip block comments, line comments, trailing commas
+//   Pass 3: escape literal newlines inside string values
+//   Pass 4: truncate at last balanced brace
+// Only throws if all 4 passes fail.
+function robustJsonParse(rawContent) {
+    let attempts = 0;
+    let lastErr = null;
+
+    // Strip ```json / ```vir wrapper if AI mistakenly nested code fences
+    let content = String(rawContent || '').replace(/^```(?:json|vir)?\s*\n?/i, '').replace(/\n?```\s*$/i, '').trim();
+
+    // Pass 1 — strict
+    try {
+        attempts++;
+        return { data: JSON.parse(content), recovered: false, repairAttempts: attempts };
+    } catch (e) { lastErr = e; }
+
+    // Pass 2 — strip comments + trailing commas
+    try {
+        attempts++;
+        const cleaned = content
+            .replace(/\/\*[\s\S]*?\*\//g, '')          // /* block comments */
+            .replace(/(^|[^:\\])\/\/[^\n\r]*/g, '$1')  // // line comments (preserve http://)
+            .replace(/,\s*([\}\]])/g, '$1');            // trailing commas
+        return { data: JSON.parse(cleaned), recovered: true, repairAttempts: attempts };
+    } catch (e) { lastErr = e; }
+
+    // Pass 3 — escape literal newlines inside string values + previous fixes
+    try {
+        attempts++;
+        const repaired = content
+            .replace(/\/\*[\s\S]*?\*\//g, '')
+            .replace(/(^|[^:\\])\/\/[^\n\r]*/g, '$1')
+            .replace(/,\s*([\}\]])/g, '$1')
+            .replace(/(?<="[^"\n]*)\n(?=[^"\n]*")/g, '\\n');
+        return { data: JSON.parse(repaired), recovered: true, repairAttempts: attempts };
+    } catch (e) { lastErr = e; }
+
+    // Pass 4 — truncate at first balanced brace where depth returns to 0
+    // (handles "extra closing brace mid-stream" case: stops at first `}` that
+    // closes the outer object, ignoring any garbage that follows).
+    try {
+        attempts++;
+        const cleaned = content
+            .replace(/\/\*[\s\S]*?\*\//g, '')
+            .replace(/(^|[^:\\])\/\/[^\n\r]*/g, '$1')
+            .replace(/,\s*([\}\]])/g, '$1');
+        let depth = 0, inStr = false, escape = false, firstBalanced = -1;
+        for (let i = 0; i < cleaned.length; i++) {
+            const ch = cleaned[i];
+            if (escape) { escape = false; continue; }
+            if (ch === '\\') { escape = true; continue; }
+            if (ch === '"') { inStr = !inStr; continue; }
+            if (inStr) continue;
+            if (ch === '{') depth++;
+            else if (ch === '}') {
+                depth--;
+                if (depth === 0) { firstBalanced = i; break; }  // first close of outer
+                if (depth < 0) break;  // unbalanced — bail
+            }
+        }
+        if (firstBalanced > 0) {
+            const truncated = cleaned.slice(0, firstBalanced + 1);
+            return { data: JSON.parse(truncated), recovered: true, repairAttempts: attempts };
+        }
+    } catch (e) { lastErr = e; }
+
+    throw lastErr || new Error('JSON parse failed after 4 repair passes');
+}
+
+function parsePacket(packet) {
+    const result = robustJsonParse(packet.body);
+    const data = result.data;
+    if (!data || typeof data !== 'object') throw new Error('Packet is not an object');
+    if (data.schema !== 1 && data.schema !== 2 && data.schema !== 3) throw new Error(`Unsupported schema: ${data.schema}`);
+    if (result.recovered) log(`JSON recovered via pass ${result.repairAttempts}`);
+    return data;
+}
+
+/**
+ * Convert flat schema-3 character object (AI emission) into nested VIR format
+ * (lorebook storage). Splits semicolon strings into arrays, builds voice_lock
+ * from flat voice_* fields, maps short flat names to canonical VIR field names.
+ */
+function flatCharToNested(flat) {
+    if (!flat || typeof flat !== 'object') return {};
+    const vir = { ...flat };
+    // outfit/underwear/accessories/equipment: string → array
+    const splitSemicolon = (s) => String(s || '').split(/\s*;\s*/).filter(Boolean);
+    if (typeof vir.outfit === 'string') vir.outfit = splitSemicolon(vir.outfit);
+    if (typeof vir.underwear === 'string') vir.underwear = splitSemicolon(vir.underwear);
+    if (typeof vir.accessories === 'string') vir.accessories = splitSemicolon(vir.accessories);
+    if (typeof vir.equipment === 'string') vir.equipment = splitSemicolon(vir.equipment);
+    // Build voice_lock from flat voice_* fields
+    const voice_lock = {};
+    if (vir.voice_gender) voice_lock.gender = vir.voice_gender;
+    if (vir.voice_vocab) voice_lock.vocab_tier = vir.voice_vocab;
+    if (vir.voice_profanity) voice_lock.profanity = vir.voice_profanity;
+    if (vir.voice_formality) voice_lock.formality = vir.voice_formality;
+    if (vir.voice_signature) voice_lock.signature_phrases = splitSemicolon(vir.voice_signature);
+    if (vir.voice_color) voice_lock.dialogue_color = vir.voice_color;
+    if (Object.keys(voice_lock).length) vir.voice_lock = voice_lock;
+    delete vir.voice_gender; delete vir.voice_vocab; delete vir.voice_profanity;
+    delete vir.voice_formality; delete vir.voice_signature; delete vir.voice_color;
+    // Map flat short names → canonical VIR field names
+    if (vir.age !== undefined && vir.age_appearance === undefined) { vir.age_appearance = vir.age; delete vir.age; }
+    if (vir.face !== undefined && vir.face_features === undefined) { vir.face_features = vir.face; delete vir.face; }
+    if (vir.brows !== undefined && vir.brow_lash === undefined) { vir.brow_lash = vir.brows; delete vir.brows; }
+    if (vir.lips !== undefined && vir.lips_teeth === undefined) { vir.lips_teeth = vir.lips; delete vir.lips; }
+    if (vir.skin !== undefined && vir.skin_fur_scales === undefined) { vir.skin_fur_scales = vir.skin; delete vir.skin; }
+    if (vir.hands !== undefined && vir.hands_feet === undefined) { vir.hands_feet = vir.hands; delete vir.hands; }
+    if (vir.voice !== undefined && vir.posture_voice === undefined) { vir.posture_voice = vir.voice; delete vir.voice; }
+    // Strip control fields
+    delete vir.action;
+    delete vir.name;
+    return vir;
+}
+
+// ============================================================================
+// STRIP LOGIC — fence-aware, RPG-HUD-friendly
+// ============================================================================
+function stripOrphanSyncBlocks(text) {
+    const blocks = findOrphanSyncBlocks(text);
+    if (!blocks.length) return text;
+    let out = text;
+    for (let i = blocks.length - 1; i >= 0; i--) {
+        const b = blocks[i];
+        out = out.slice(0, b.start) + out.slice(b.end);
+    }
+    return out;
+}
+function stripVirKeyFragments(text) {
+    if (!text) return text;
+    const TAIL = 5000;
+    const tailStart = Math.max(0, text.length - TAIL);
+    const maskedFull = maskCodeFences(text);  // protects RPG HUD's ```rpg block etc.
+    const maskedTail = maskedFull.slice(tailStart);
+    // All keys across schema 1/2/3. Covers schema-2's deeply nested keys
+    // (geometry, relationships, aftermath_marks, vad, scene_id) AND schema-3
+    // flat keys (characters, scene, states, recall).
+    const KEY_RE = /"(?:schema|characters|new_characters|vir_delta|scene|scene_state|char_state|states|active|active_characters|outfit_layers|hair_state|body_fluids|voice_lock|voice_color|voice_gender|voice_vocab|voice_profanity|dialogue_color|face_features|skin_fur_scales|recall|recall_characters|aftermath|aftermath_marks|geometry|relationships|vad|scene_id|position|injuries)"\s*:/g;
+    const hits = [];
+    let m;
+    KEY_RE.lastIndex = 0;
+    while ((m = KEY_RE.exec(maskedTail)) !== null) hits.push(m.index);
+    if (hits.length < 3) return text;
+    const firstHit = hits[0];
+    let fragStart = firstHit;
+    for (let i = firstHit - 1; i >= 0; i--) {
+        const maskedCh = maskedTail[i];
+        const origCh = text[tailStart + i];
+        // Stop if we're crossing into a masked (fenced) region
+        if (maskedCh === ' ' && origCh !== ' ' && origCh !== '\t' && origCh !== '\n' && origCh !== '\r') break;
+        if (/[\s,{}[\]":\\\w.\-+]/.test(maskedCh)) fragStart = i;
+        else break;
+    }
+    if (firstHit - fragStart > 800) {
+        fragStart = firstHit;
+        for (let i = firstHit - 1; i >= 0; i--) {
+            if (maskedTail[i] === '\n') { fragStart = i + 1; break; }
+        }
+    }
+    const absStart = tailStart + fragStart;
+    const sliceToStrip = text.slice(absStart);
+    if (sliceToStrip.includes('```')) return text;
+    return text.slice(0, absStart).trimEnd();
+}
+function stripVirFromMessage(text, processedRaw) {
+    let updated = text || '';
+    for (const raw of processedRaw || []) {
+        if (updated.includes(raw)) updated = updated.replace(raw, '');
+    }
+    updated = updated.replace(/```vir\b[\s\S]*?```/gi, '');
+    updated = updated.replace(/```vir\b[\s\S]*$/i, '');
+    updated = stripOrphanSyncBlocks(updated);
+    updated = stripVirKeyFragments(updated);
+    return updated.replace(/\n{3,}/g, '\n\n').trim();
+}
+
+// ============================================================================
+// WORLD LIFECYCLE
+// ============================================================================
+async function ensureWorldLoaded(worldName) {
+    let data = await loadWorldInfo(worldName);
+    if (!data || typeof data !== 'object') data = { entries: {} };
+    getEntries(data);
+    ensureSchemaEntry(data);
+    await saveWorldInfo(worldName, data, true);
+    await updateWorldInfoList();
+    return data;
+}
+async function activateCurrentWorld() {
+    if (!settings().enabled) return;
+    const worldName = currentWorldName();
+    if (!worldName) return;
+    await ensureWorldLoaded(worldName);
+    rememberWorldChat(worldName);
+    const wiSettings = getWorldInfoSettings();
+    // selected_world_info is a module-level `let` exported from world-info.js — it's the
+    // backing array for ST's "Active World(s) for all chats" UI. NOT part of wiSettings.
+    const active = Array.isArray(selected_world_info) ? selected_world_info : [];
+    const nextGlobal = [...active.filter(n => n !== worldName && !isVirWorldName(n)), worldName];
+    updateWorldInfoSettings(wiSettings, [...new Set(nextGlobal)]);
+    if (settings().bindToChat && typeof chat_metadata === 'object') {
+        if (chat_metadata[WI_METADATA_KEY] !== worldName) {
+            chat_metadata[WI_METADATA_KEY] = worldName;
+            try { await saveMetadata(); } catch (e) { warn('saveMetadata failed', e); }
+        }
+    }
+    injectVirContract();
+    await injectVirState();
+    updateStatus();
+}
+async function deleteVirWorld(worldName) {
+    if (!isVirWorldName(worldName)) return false;
+    const wiSettings = getWorldInfoSettings();
+    const active = Array.isArray(selected_world_info) ? selected_world_info : [];
+    updateWorldInfoSettings(wiSettings, active.filter(n => n !== worldName));
+    const deleted = await deleteWorldInfo(worldName);
+    if (deleted) { delete settings().worldChatMap?.[worldName]; saveSettingsDebounced(); }
+    return deleted;
+}
+async function cleanupVirForDeletedChat(chatId) {
+    if (!settings().cleanupOnChatDelete || !chatId) return;
+    const map = settings().worldChatMap || {};
+    const matches = Object.entries(map).filter(([, info]) => info?.chatId === String(chatId)).map(([w]) => w);
+    if (!matches.length) return;
+    let deleted = 0;
+    for (const w of matches) if (await deleteVirWorld(w)) deleted++;
+    if (deleted) toastr.info(`Deleted ${deleted} VIR lorebook(s) for removed chat.`, 'FF4 VIR Sync');
+    await updateWorldInfoList(); updateStatus();
+}
+
+// ============================================================================
+// VIR CONTRACT INJECTION (RPG-HUD-style — extension injects its own prompt)
+// ============================================================================
+function injectVirContract() {
+    if (!settings().enabled || !settings().contractInjection) return;
+    try {
+        const ctx = getContext();
+        const setExtensionPrompt = ctx?.setExtensionPrompt || window.setExtensionPrompt;
+        if (typeof setExtensionPrompt !== 'function') return;
+        // POSITION 0 = top of system prompt (same as RPG HUD's updatePrompt).
+        // Maximum attention weight — AI sees the contract BEFORE any chat history,
+        // so it doesn't drift back to old schema patterns from earlier messages.
+        setExtensionPrompt('FF4_VIR_CONTRACT', VIR_CONTRACT, 0, 0, false, 'system');
+        log('VIR contract injected at position 0 (system top)');
+    } catch (e) { warn('Contract injection failed', e); }
+}
+function clearVirContract() {
+    try {
+        const ctx = getContext();
+        const setExtensionPrompt = ctx?.setExtensionPrompt || window.setExtensionPrompt;
+        if (typeof setExtensionPrompt !== 'function') return;
+        setExtensionPrompt('FF4_VIR_CONTRACT', '', 0, 0);
+        setExtensionPrompt('FF4_VIR_STATE', '', 0, 0);
+    } catch { /* ignore */ }
+}
+
+/**
+ * Build the dynamic VIR state context for injection at system-prompt level.
+ * Mirrors RPG HUD's buildContext() — formatted, readable summary of the
+ * CURRENT world state that the AI references when generating its reply.
+ */
+async function buildVirStateText() {
+    const worldName = currentWorldName();
+    if (!worldName) return '';
+    let data;
+    try { data = await loadWorldInfo(worldName); } catch { return ''; }
+    if (!data) return '';
+
+    const lines = ['=== VIR WORLD STATE ==='];
+
+    // Scene
+    const sceneEntry = Object.values(getEntries(data)).find(e => e?.comment === 'FF4 SCENE_STATE');
+    const scene = parseSceneState(sceneEntry);
+    if (scene.location || scene.time || scene.weather) {
+        const bits = [];
+        if (scene.location) bits.push(`location: ${scene.location}`);
+        if (scene.time) bits.push(`time: ${scene.time}`);
+        if (scene.weather) bits.push(`weather: ${scene.weather}`);
+        lines.push(`[SCENE] ${bits.join(' | ')}`);
+    }
+
+    const active = Array.isArray(scene.active_characters) ? scene.active_characters : [];
+    const sceneChars = scene.characters || {};
+
+    // Active character cards (compact one-block per char)
+    if (active.length) {
+        lines.push(`[ACTIVE CHARACTERS: ${active.join(', ')}]`);
+        for (const name of active) {
+            const entry = findCharacterEntry(data, name);
+            if (!entry) continue;
+            const vir = parseActiveVir(entry.content || '');
+            const card = [
+                `  ${name}:`,
+                vir.species ? `    species: ${vir.species}` : '',
+                vir.hair ? `    hair: ${vir.hair}` : '',
+                vir.eyes ? `    eyes: ${vir.eyes}` : '',
+                vir.skin_fur_scales ? `    skin: ${vir.skin_fur_scales}` : '',
+                vir.body ? `    body: ${vir.body}` : '',
+                vir.marks ? `    marks: ${vir.marks}` : '',
+                Array.isArray(vir.outfit) && vir.outfit.length ? `    outfit: ${vir.outfit.join('; ')}` : '',
+                vir.voice_lock?.dialogue_color ? `    dialogue_color: ${vir.voice_lock.dialogue_color}` : '',
+            ].filter(Boolean);
+            lines.push(...card);
+            // Mutable state for this char
+            const s = sceneChars[name];
+            if (s) {
+                const stateBits = [];
+                if (s.outfit_state) stateBits.push(`outfit:${s.outfit_state}`);
+                if (s.hair_state) stateBits.push(`hair:${s.hair_state}`);
+                if (s.body_fluids) stateBits.push(`fluids:${s.body_fluids}`);
+                if (s.injuries) stateBits.push(`injuries:${s.injuries}`);
+                if (s.aftermath) stateBits.push(`aftermath:${s.aftermath}t`);
+                if (s.position) stateBits.push(`pos:${s.position}`);
+                if (stateBits.length) lines.push(`    state: ${stateBits.join(' | ')}`);
             }
         }
     }
-    return drifts;
-}
 
-function rewritePicForDrift(text, drifts) {
-    // Surgical insertion: after first occurrence of <char name> in each drifted pic, append the missing canonical tokens
-    let updated = text;
-    for (const d of drifts) {
-        if (!updated.includes(d.pic)) continue;
-        const newPic = d.pic.replace(new RegExp(`(${d.char.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'i'),
-            `$1 [${d.missing.join(', ')}]`);
-        updated = updated.replace(d.pic, newPic);
+    // Offscreen roster (compact reference)
+    const allChars = characterEntries(data);
+    const offscreen = allChars.map(([, e]) => characterEntryName(e)).filter(n => n && !active.includes(n));
+    if (offscreen.length) {
+        lines.push(`[KNOWN OFFSCREEN] ${offscreen.join(', ')}`);
+        lines.push('  (emit recall_characters:["Name"] in vir packet to reactivate)');
     }
-    return updated;
-}
 
-function hashPhrase(phrase) {
-    let h = 0;
-    const s = String(phrase || '').toLowerCase().replace(/\s+/g, ' ').trim();
-    for (let i = 0; i < s.length; i++) h = ((h << 5) - h + s.charCodeAt(i)) | 0;
-    return Math.abs(h);
-}
-
-function extractKeyPhrases(text, n = 8) {
-    if (!text) return [];
-    const sentences = text.split(/(?<=[.!?])\s+/).filter(s => s.length > 20 && s.length < 200);
-    return sentences.slice(0, n).map(s => hashPhrase(s));
-}
-
-function detectRepetition(text, worldName) {
+    // Recall window
     const st = settings();
-    const turn = currentChatTurn();
-    st.phraseHashes = st.phraseHashes || {};
-    st.phraseHashes[worldName] = st.phraseHashes[worldName] || {};
-    const history = st.phraseHashes[worldName];
-    const currentHashes = extractKeyPhrases(text);
-    const lookback = [history[turn - 1] || [], history[turn - 2] || []].flat();
-    const repeats = currentHashes.filter(h => lookback.includes(h));
-    history[turn] = currentHashes;
-    // Prune old
-    for (const k of Object.keys(history)) {
-        if (turn - parseInt(k) > 5) delete history[k];
+    const recall = st.recallCharacters?.[worldName];
+    if (recall && Object.keys(recall).length) {
+        const bits = Object.entries(recall).map(([n, t]) => `${n}(${t}t)`);
+        lines.push(`[RECALL WINDOW] ${bits.join(', ')}`);
     }
-    return repeats.length;
+
+    lines.push('=== END VIR STATE ===');
+    return lines.join('\n');
 }
 
-function detectAntiEcho(aiText, lastUserText) {
-    if (!aiText || !lastUserText) return false;
-    const firstSent = aiText.split(/[.!?]/)[0]?.toLowerCase().trim();
-    const userFirst = lastUserText.split(/[.!?]/)[0]?.toLowerCase().trim();
-    if (!firstSent || !userFirst || userFirst.length < 20) return false;
-    // Simple containment heuristic — if AI's first sentence contains 60%+ of user's first sentence words
-    const userWords = userFirst.split(/\s+/).filter(w => w.length > 3);
-    if (userWords.length < 4) return false;
-    const hits = userWords.filter(w => firstSent.includes(w)).length;
-    return hits / userWords.length > 0.6;
+/**
+ * Refresh the dynamic VIR state injection. RPG-HUD-style:
+ * setExtensionPrompt(EXT, text, 0, 0, false, 'system') = inject at top
+ * of system prompt, before chat history.
+ */
+async function injectVirState() {
+    if (!settings().enabled || !settings().contractInjection) return;
+    try {
+        const ctx = getContext();
+        const setExtensionPrompt = ctx?.setExtensionPrompt || window.setExtensionPrompt;
+        if (typeof setExtensionPrompt !== 'function') return;
+        const text = await buildVirStateText();
+        if (!text) {
+            setExtensionPrompt('FF4_VIR_STATE', '', 0, 0);
+            return;
+        }
+        setExtensionPrompt('FF4_VIR_STATE', text, 0, 0, false, 'system');
+        log('VIR state injected (top-level)');
+    } catch (e) { warn('State injection failed', e); }
 }
 
-async function runWatchdogs(messageId) {
-    if (!settings().enabled) return;
+// ============================================================================
+// PROCESS SYNC PACKET — apply state to lorebook
+// ============================================================================
+async function processSyncPacket(sync) {
+    const worldName = currentWorldName();
+    if (!worldName) throw new Error('No active chat id');
+    const data = await ensureWorldLoaded(worldName);
+    const st = settings();
+    const pinned = new Set(st.pinnedCharacters?.[worldName] || []);
+    const upserted = [];
+
+    // Recall mechanism — schema 3 uses `recall[]`, schema 1/2 uses `recall_characters[]`
+    const recallList = Array.isArray(sync.recall) ? sync.recall
+                     : Array.isArray(sync.recall_characters) ? sync.recall_characters : [];
+    const turns = st.recallTurnsDefault || 8;
+    st.recallCharacters = st.recallCharacters || {};
+    st.recallCharacters[worldName] = st.recallCharacters[worldName] || {};
+    for (const raw of recallList) {
+        const name = canonicalizeName(raw).canonical;
+        if (name) st.recallCharacters[worldName][name] = turns;
+    }
+    saveSettingsDebounced();
+    const recallActive = new Set(Object.keys(st.recallCharacters[worldName] || {}));
+
+    // ── Scene state merge (schema 3 flat OR schema 1/2 nested) ──
+    const existingSceneEntry = Object.values(getEntries(data)).find(e => e?.comment === 'FF4 SCENE_STATE');
+    const existingScene = parseSceneState(existingSceneEntry);
+    let mergedScene = { ...existingScene };
+
+    // Schema 3: flat `scene` object
+    if (sync.scene && typeof sync.scene === 'object') {
+        if (sync.scene.location !== undefined) mergedScene.location = sync.scene.location;
+        if (sync.scene.time !== undefined) mergedScene.time = sync.scene.time;
+        if (sync.scene.weather !== undefined) mergedScene.weather = sync.scene.weather;
+        if (sync.scene.active !== undefined) {
+            mergedScene.active_characters = typeof sync.scene.active === 'string'
+                ? sync.scene.active.split(/\s*,\s*/).filter(Boolean)
+                : sync.scene.active;
+        }
+    }
+    // Schema 1/2 backward compat
+    if (sync.scene_state) {
+        mergedScene = mergeSceneState(mergedScene, sync.scene_state);
+    }
+
+    // ── Per-char mutable state (schema 3 `states[]` OR schema 1/2 `char_state` object) ──
+    mergedScene.characters = mergedScene.characters || {};
+    if (Array.isArray(sync.states)) {
+        for (const s of sync.states) {
+            if (!s || !s.name) continue;
+            const name = canonicalizeName(s.name).canonical;
+            const charState = { ...(mergedScene.characters[name] || {}) };
+            if (s.outfit_state !== undefined) charState.outfit_state = s.outfit_state;
+            if (s.hair_state !== undefined) charState.hair_state = s.hair_state;
+            if (s.body_fluids !== undefined) charState.body_fluids = s.body_fluids;
+            if (s.injuries !== undefined) charState.injuries = s.injuries;
+            if (s.position !== undefined) charState.position = s.position;
+            if (s.aftermath !== undefined) charState.aftermath = s.aftermath;
+            mergedScene.characters[name] = charState;
+        }
+    }
+    if (sync.char_state && typeof sync.char_state === 'object') {
+        for (const [name, s] of Object.entries(sync.char_state)) {
+            mergedScene.characters[name] = { ...(mergedScene.characters[name] || {}), ...s };
+        }
+    }
+    ensureSceneStateEntry(data, mergedScene);
+
+    // ── Characters: schema 3 (`characters[]` array) ──
+    if (Array.isArray(sync.characters)) {
+        for (const char of sync.characters) {
+            if (!char || !char.name) continue;
+            const name = canonicalizeName(char.name).canonical;
+            const vir = flatCharToNested(char);
+            let entry;
+            if (char.action === 'update') {
+                entry = applyDelta(data, name, vir);
+            } else {
+                // "create" or unspecified — treat as new/full character
+                entry = upsertCharacter(data, name, { vir });
+            }
+            if (entry) upserted.push(characterEntryName(entry));
+        }
+    }
+    // Schema 1/2 backward compat: new_characters (object-keyed) + vir_delta (object-keyed)
+    for (const [name, payload] of Object.entries(sync.new_characters || {})) {
+        const e = upsertCharacter(data, name, payload);
+        if (e) upserted.push(characterEntryName(e));
+    }
+    for (const [name, delta] of Object.entries(sync.vir_delta || {})) {
+        const e = applyDelta(data, name, delta);
+        if (e) upserted.push(characterEntryName(e));
+    }
+
+    // Active char names: from scene.active + new chars + recall
+    const activeNames = new Set(mergedScene.active_characters || []);
+    if (Array.isArray(sync.characters)) {
+        for (const char of sync.characters) {
+            if (char?.name && char.action !== 'update') activeNames.add(canonicalizeName(char.name).canonical);
+        }
+    }
+    for (const name of Object.keys(sync.new_characters || {})) activeNames.add(name);
+    for (const name of Object.keys(sync.vir_delta || {})) activeNames.add(name);
+
+    // Auto-assign dialogue colors if missing
+    assignDialogueColors(data);
+
+    // Apply smart tier flags
+    const combinedActive = new Set([...activeNames, ...recallActive]);
+    setActiveFlags(data, combinedActive, pinned, recallActive);
+
+    // Rebuild always-on entries
+    rebuildRosterEntry(data);
+    ensureFF4StateEntry(data);
+
+    await saveWorldInfo(worldName, data, true);
+    await updateWorldInfoList();
+    await activateCurrentWorld();
+    await injectVirState();
+    return { worldName, upserted: uniqueClean(upserted) };
+}
+
+// ============================================================================
+// PROCESS MESSAGE — parse + strip
+// ============================================================================
+async function processMessage(messageId) {
     const context = getContext();
     const message = context.chat?.[messageId];
     if (!message || message.is_user) return;
     const text = message.mes || '';
-    const worldName = currentWorldName();
-    if (!worldName) return;
-    const st = settings();
-    const turn = currentChatTurn();
+    // Skip if no possible VIR content
+    if (!text.includes('```vir') && !text.includes('<vir_sync') && !text.includes('"schema"')
+        && !text.includes('"characters"') && !text.includes('"vir_delta"')
+        && !text.includes('"scene_state"') && !text.includes('"new_characters"')
+        && !text.includes('"scene"') && !text.includes('"states"')) return;
 
-    // Reply shape
-    if (st.shapeVarianceEnabled) {
-        const shape = detectReplyShape(text);
-        if (shape) {
-            st.shapeHistory = st.shapeHistory || {};
-            st.shapeHistory[worldName] = st.shapeHistory[worldName] || [];
-            st.shapeHistory[worldName].push(shape);
-            if (st.shapeHistory[worldName].length > 5) st.shapeHistory[worldName].shift();
-        }
-    }
+    const packets = extractPackets(text);
+    message.extra = message.extra || {};
+    message.extra[EXT] = message.extra[EXT] || {};
+    const processedHashes = new Set(message.extra[EXT].processed || []);
 
-    // Banned vocabulary
-    const bannedHits = detectBannedVocabHits(text, st.bannedVocabulary || BANNED_VOCABULARY_DEFAULT);
-    if (bannedHits.length && st.bannedVocabPolicy !== 'off') {
-        st.bannedVocabHits = st.bannedVocabHits || {};
-        st.bannedVocabHits[worldName] = st.bannedVocabHits[worldName] || [];
-        for (const term of bannedHits) {
-            st.bannedVocabHits[worldName].push({ turn, term });
-        }
-        if (st.bannedVocabHits[worldName].length > 20) {
-            st.bannedVocabHits[worldName] = st.bannedVocabHits[worldName].slice(-20);
-        }
-        noteSyncStatus(`Banned vocab hits: ${bannedHits.join(', ')}`, [`avoided slop terms: ${bannedHits.join(', ')}`]);
-    }
+    const processedRaw = [];
+    const upsertedAll = new Set();
 
-    // Female acoustic guard
-    if (st.femaleAcousticsGuard) {
-        const data = await loadWorldInfo(worldName);
-        if (data) {
-            const femaleNames = [];
-            for (const [, entry] of characterEntries(data)) {
-                const name = characterEntryName(entry);
-                if (!name) continue;
-                const vir = parseActiveVir(entry.content || '');
-                if (vir?.voice_lock?.gender === 'female') femaleNames.push(name);
-            }
-            const violations = detectFemaleAcousticViolations(text, femaleNames);
-            if (violations.length) {
-                noteSyncStatus(`Female voice acoustic violation: ${violations.join(', ')}`,
-                    [`${violations.join(', ')} described with low/deep/husky/throaty — swap to warm/quiet/airy`]);
-            }
-        }
-    }
-
-    // Macro emotion
-    if (st.macroEmotionPolicy && st.macroEmotionPolicy !== 'off') {
-        const macros = detectMacroEmotion(text);
-        if (macros.length) {
-            noteSyncStatus(`Macro emotion phrases: ${macros.slice(0, 3).join(' / ')}`,
-                [`use physical cues instead of "${macros[0]}" — show, don't tell`]);
-        }
-    }
-
-    // Repetition audit
-    if (st.repetitionAuditEnabled) {
-        const repeats = detectRepetition(text, worldName);
-        if (repeats >= 2) {
-            noteSyncStatus(`Phrase repetition vs last 2 turns: ${repeats} hits`,
-                [`${repeats} phrases echoed from last 2 turns — vary next turn`]);
-        }
-    }
-
-    // Anti-Echo (compare AI reply first sentence vs last user input)
-    if (st.antiEchoEnabled) {
-        const chat = context.chat || [];
-        const lastUserIdx = (() => {
-            for (let i = chat.length - 1; i >= 0; i--) {
-                if (chat[i].is_user) return i;
-            }
-            return -1;
-        })();
-        if (lastUserIdx >= 0) {
-            const userText = chat[lastUserIdx].mes || '';
-            if (detectAntiEcho(text, userText)) {
-                noteSyncStatus('Anti-echo: AI first sentence echoes user input',
-                    ['AI restated user input — start at T+1 (after user turn ended)']);
-            }
-        }
-    }
-
-    // Drift watchdog with surgical rewrite
-    if (st.driftPolicy && st.driftPolicy !== 'off') {
-        const data = await loadWorldInfo(worldName);
-        if (data) {
-            const activeChars = [];
-            for (const [, entry] of characterEntries(data)) {
-                const name = characterEntryName(entry);
-                if (!name || !entry.constant) continue;
-                const vir = parseActiveVir(entry.content || '');
-                if (vir) activeChars.push({ name, vir });
-            }
-            const drifts = detectPicDrift(text, activeChars);
-            if (drifts.length) {
-                st.driftWarnings = st.driftWarnings || {};
-                st.driftWarnings[worldName] = st.driftWarnings[worldName] || [];
-                for (const d of drifts) st.driftWarnings[worldName].push({ turn, char: d.char, missing: d.missing });
-                if (st.driftWarnings[worldName].length > 20) {
-                    st.driftWarnings[worldName] = st.driftWarnings[worldName].slice(-20);
-                }
-                if (st.driftPolicy === 'rewrite') {
-                    const rewritten = rewritePicForDrift(text, drifts);
-                    if (rewritten !== text) {
-                        message.mes = rewritten;
-                        updateMessageBlock(messageId, message);
-                    }
-                }
-                const summary = drifts.map(d => `${d.char}:${d.missing.slice(0, 3).join('/')}`).join('; ');
-                noteSyncStatus(`Pic drift detected: ${summary}`, [`drift: ${summary} — restore canonical tokens next pic`]);
-            }
-        }
-    }
-
-    saveSettingsDebounced();
-    // Refresh FF4_STATE block so next AI turn sees updated audit signals
     try {
-        const data = await loadWorldInfo(worldName);
-        if (data) {
-            ensureFF4StateEntry(data);
-            await saveWorldInfo(worldName, data, true);
-        }
-    } catch (e) { error('FF4_STATE refresh', e); }
-}
-
-// ---------- Scene ID stamping (cross-scene knowledge barrier) ----------
-
-function inferSceneId(scene, prevId) {
-    if (!scene) return prevId || 'scene-1';
-    const loc = (scene.location || '').toLowerCase().replace(/\W+/g, '-').slice(0, 24);
-    const turn = currentChatTurn();
-    if (!loc) return prevId || `scene-${turn}`;
-    // If location changed, new id; else keep
-    if (prevId && prevId.startsWith(`${loc}-`)) return prevId;
-    return `${loc}-${turn}`;
-}
-
-function stampSceneId(worldName, scene) {
-    const st = settings();
-    st.sceneIds = st.sceneIds || {};
-    st.sceneIds[worldName] = st.sceneIds[worldName] || { currentId: null, byTurn: {} };
-    const prev = st.sceneIds[worldName].currentId;
-    const next = inferSceneId(scene, prev);
-    st.sceneIds[worldName].currentId = next;
-    st.sceneIds[worldName].byTurn[currentChatTurn()] = next;
-    return next;
-}
-
-// ====================================================================
-// Card auto-bootstrapper — parse card on empty chats, draft initial VIR
-// ====================================================================
-
-function extractFieldFromDescription(desc, fieldKeywords) {
-    if (!desc) return null;
-    for (const kw of fieldKeywords) {
-        // Look for "X: value" or "X is value" or sentence containing the keyword
-        const reColon = new RegExp(`\\b${kw}\\b\\s*[:=]\\s*([^\\n.;]+)`, 'i');
-        const mCol = desc.match(reColon);
-        if (mCol) return mCol[1].trim().slice(0, 200);
-        const reIs = new RegExp(`\\b${kw}\\b[^.\\n]*?\\b(?:is|are|has|have)\\b\\s+([^.\\n;]+)`, 'i');
-        const mIs = desc.match(reIs);
-        if (mIs) return mIs[1].trim().slice(0, 200);
-    }
-    return null;
-}
-
-function bootstrapVirFromCard(card) {
-    if (!card) return null;
-    const desc = `${card.description || ''}\n${card.personality || ''}\n${card.first_mes || ''}`;
-    const vir = {};
-    const hairText = extractFieldFromDescription(desc, ['hair', 'hairstyle']);
-    if (hairText) vir.hair = hairText;
-    const eyesText = extractFieldFromDescription(desc, ['eyes', 'iris', 'gaze']);
-    if (eyesText) vir.eyes = eyesText;
-    const skinText = extractFieldFromDescription(desc, ['skin', 'complexion']);
-    if (skinText) vir.skin_fur_scales = skinText;
-    const bodyText = extractFieldFromDescription(desc, ['body', 'build', 'figure', 'physique', 'height']);
-    if (bodyText) vir.body = bodyText;
-    const heightMatch = desc.match(/\b(\d{3})\s*cm\b|\b([45-7]['′](?:\d+["″])?)\b/i);
-    if (heightMatch) vir.height = heightMatch[0];
-    const ageMatch = desc.match(/\b(?:age|aged|years old)\s*[:=]?\s*(\d{2})\b/i) || desc.match(/\b(\d{2})\s*(?:years old|yo)\b/i);
-    if (ageMatch) vir.age_appearance = `${ageMatch[1]} years old`;
-    else if (/\b(?:teen|teenage)\b/i.test(desc)) vir.age_appearance = 'late teens';
-    else if (/\b(?:young adult|early twenties|20s)\b/i.test(desc)) vir.age_appearance = 'early 20s';
-    else if (/\b(?:mid 30s|middle aged|mid-thirties)\b/i.test(desc)) vir.age_appearance = 'mid 30s';
-    // Outfit hints: look for first 1-3 sentences mentioning wearing/dressed/clad
-    const outfitMatches = desc.match(/\b(?:wearing|dressed in|clad in|wears|outfit|attire)[^.\n]+\./gi);
-    if (outfitMatches?.length) {
-        vir.outfit = outfitMatches.slice(0, 3).map(s => s.replace(/^(?:wearing|dressed in|clad in|wears|outfit|attire)[:\s]+/i, '').trim());
-    }
-    return Object.keys(vir).length ? vir : null;
-}
-
-async function autoBootstrapCardIfEmpty() {
-    if (!settings().enabled || !settings().autoBootstrapEnabled) return;
-    const worldName = currentWorldName();
-    if (!worldName) return;
-    const data = await ensureWorldLoaded(worldName);
-    if (characterCount(data) > 0) return; // only on empty
-    const context = getContext();
-    const card = context?.characters?.[context.characterId];
-    if (!card) return;
-    const draftVir = bootstrapVirFromCard(card);
-    if (!draftVir) return;
-    const name = card.name || 'CharCard';
-    const entries = getEntries(data);
-    const uid = nextUid(data);
-    const entry = makeEntry({
-        uid, key: [name], comment: `DRAFT VIR: ${name}`,
-        content: `[DRAFT VIR: ${name}]\nAuto-extracted from character card. Refine via <vir_sync> new_characters in your first reply -- fill missing locked fields.\n${lockedVisualCard(name, draftVir)}\n[/DRAFT VIR]`,
-        constant: false,
-        disable: true,
-        order: TIER.OFFSCREEN.order, depth: TIER.OFFSCREEN.depth, position: TIER.OFFSCREEN.position,
-    });
-    entries[uid] = entry;
-    await saveWorldInfo(worldName, data, true);
-    await updateWorldInfoList();
-    toastr.info(`Drafted initial VIR for ${name} from card. AI will refine on first reply.`, 'FF4 VIR Auto-Bootstrap');
-}
-
-// ====================================================================
-// Group chat support — auto-pin all members
-// ====================================================================
-
-async function handleGroupChat() {
-    const context = getContext();
-    if (!context?.groupId) return;
-    const group = context.groups?.find(g => g.id === context.groupId);
-    if (!group) return;
-    const worldName = currentWorldName();
-    if (!worldName) return;
-    const memberNames = (group.members || [])
-        .map(avatar => context.characters?.find(c => c.avatar === avatar)?.name)
-        .filter(Boolean);
-    if (!memberNames.length) return;
-    const st = settings();
-    st.pinnedCharacters = st.pinnedCharacters || {};
-    st.pinnedCharacters[worldName] = st.pinnedCharacters[worldName] || [];
-    let added = 0;
-    for (const name of memberNames) {
-        const canonical = canonicalizeName(name).canonical;
-        if (canonical && !st.pinnedCharacters[worldName].includes(canonical)) {
-            st.pinnedCharacters[worldName].push(canonical);
-            added++;
-        }
-    }
-    if (added) {
-        saveSettingsDebounced();
-        log(`Group chat: auto-pinned ${added} member(s).`);
-        await reapplyTiers?.();
-    }
-}
-
-// ====================================================================
-// Background life injector + Off-screen event generator
-// ====================================================================
-
-const BACKGROUND_LIFE_POOL = [
-    'distant traffic hum through closed windows',
-    'a cat yowls in the alley below',
-    'the radiator clicks and ticks',
-    'wind rattles a loose pane',
-    'pipes groan deep in the walls',
-    'somewhere upstairs a door shuts',
-    'rain picks up against the glass',
-    'a streetlight outside flickers and steadies',
-    'the building creaks settling',
-    'distant siren rises and fades',
-    'a clock somewhere chimes once',
-    'fluorescent bulb buzzes faintly',
-    'wind moves the curtains by a finger',
-    'far-off laughter through thin walls',
-    'fridge hum cycles on, then off',
-];
-
-const OFF_SCREEN_EVENT_POOL = [
-    "Ymir's phone buzzes (unread, screen-side-down)",
-    'a door opens somewhere down the hall',
-    'the storm outside intensifies',
-    'distant footsteps approach, then pass',
-    'somewhere a glass breaks',
-    'an unknown number tries to ring through',
-    "an NPC's name comes up on a passing TV/radio",
-    'the lights flicker briefly',
-    'a notification chimes on a screen no one is watching',
-    'wind slams a door shut elsewhere in the building',
-    'rain turns to hail for a moment',
-    'something is delivered to the door (knock, then silence)',
-    'a car alarm wails outside, then dies',
-    'a power flicker — clocks blink',
-    'somewhere out of frame, someone is crying',
-];
-
-let lastBackgroundTurn = 0;
-let lastOffScreenTurn = 0;
-
-function pickRandom(pool) {
-    return pool[Math.floor(Math.random() * pool.length)];
-}
-
-async function injectWorldTexture() {
-    const st = settings();
-    const turn = currentChatTurn();
-    let setExtensionPrompt;
-    try {
-        const ctx = getContext();
-        setExtensionPrompt = ctx?.setExtensionPrompt || window.setExtensionPrompt;
-    } catch { return; }
-    if (typeof setExtensionPrompt !== 'function') return;
-
-    // Background life: every N turns when enabled
-    if (st.backgroundLifeEnabled) {
-        const density = parseInt(st.backgroundLifeDensity, 10) || 10;
-        if (turn - lastBackgroundTurn >= density) {
-            const hint = pickRandom(BACKGROUND_LIFE_POOL);
-            setExtensionPrompt('FF4_VIR_BG_LIFE', `[BACKGROUND] ${hint}`, 1, 0, false, 'system');
-            lastBackgroundTurn = turn;
-        } else {
-            setExtensionPrompt('FF4_VIR_BG_LIFE', '', 1, 0);
-        }
-    } else {
-        setExtensionPrompt('FF4_VIR_BG_LIFE', '', 1, 0);
-    }
-
-    // Off-screen events: every N turns when enabled
-    if (st.offScreenEventsEnabled) {
-        const density = parseInt(st.offScreenEventsDensity, 10) || 12;
-        if (turn - lastOffScreenTurn >= density) {
-            const evt = pickRandom(OFF_SCREEN_EVENT_POOL);
-            setExtensionPrompt('FF4_VIR_OFFSCREEN', `[OFF-SCREEN] ${evt}`, 1, 0, false, 'system');
-            lastOffScreenTurn = turn;
-        } else {
-            setExtensionPrompt('FF4_VIR_OFFSCREEN', '', 1, 0);
-        }
-    } else {
-        setExtensionPrompt('FF4_VIR_OFFSCREEN', '', 1, 0);
-    }
-}
-
-// ====================================================================
-// Mode Sync — extension dynamic injection via setExtensionPrompt
-// ====================================================================
-
-const MODE_SYNC_BLOCKS = {
-    agency_reactive: `[AGENCY_REACTIVE] AI never narrates {{user}} action/speech/thought. Describe only stimuli applied to {{user}} and physical reactions. T+1 continuation. Physics_exception = external impact / biological reflex only.`,
-    agency_guided: `[AGENCY_GUIDED] Elaborate user's stated intent into vivid prose. Integrate completely, embody fully, no time-skips, chronological top-to-bottom. Verify inclusion before finalizing.`,
-    aftermath: `[AFTERMATH_ACTIVE] [CHAR_STATE] aftermath counters >0 for some chars. Pics carry marks/soreness/fluids/clothing-state. Prose acknowledges body state — winces, soreness, lingering taste, fluids drying, afterglow. Do NOT reset to neutral.`,
-    nsfw_lexicon: `[NSFW_LEXICON_ACTIVE] Vary body-part/act/sound/sensation register every turn. Track last-turn vocab; pull DIFFERENT register this turn. Same 3 nouns in 3 consecutive turns = critical failure. Banned clinical: vulva/semen/penis/glutes/areola — use pussy/cum/cock/ass/nipples. In-dialogue moans mandatory ("Uunh mmm fuck").`,
-    edging: `[EDGING_ACTIVE] Tension >= 7, rung >= 5 sustained. Emit at least one approach-then-pull-back per turn. Extended arousal states persist 3-5 turns. Release on user prompt or arc justification, not turn count.`,
-    multi_partner: `[MULTI_PARTNER_ACTIVE] 3+ active chars in NSFW scene. State geometry explicitly (positions, contact points). Attention rotation: no partner ignored >3 turns. Per-partner CHAR_STATE. Wide-shot camera mandatory unless extreme closeup.`,
-    power_dynamics: `[POWER_DYNAMICS_ACTIVE] Asymmetric scene. Use language tier matching context (soft/classic/hard); pair degrading-affection with care; aftercare = beat not footnote. Voice-locks remain through power flips.`,
-    challenge: `[CHALLENGE_MODE] {{user}} has no plot armor. NPCs have free will, can lie/steal/manipulate/push back. World consequences real. NPCs default to self-preservation > loyalty. Neglected situations worsen.`,
-    cynicism: `[CYNICISM_APERTURE] High-friction tonal mandate. Every victory has cost. No unearned hope. Replace rust/grime aesthetic with entropy/cost weight.`,
-    cyoa: `[CYOA_MODE] End each prose turn with <details type="choices"> containing 3-4 numbered choices with distinct tones (bold/cautious/curious/sexual/clever/soft/dangerous). PM still emitted. vir_sync deferred to next turn.`,
-    inner_monologue: `[INNER_MONOLOGUE_ACTIVE] Use [Inner: <Name>] tag for character thought, 1-2 per turn max. Matches voice_lock register. Not for {{user}} unless persona-permitted.`,
-    dynamic_simulation: `[DYNAMIC_SIMULATION] Background NPC actions, off-screen events, world-clock advance independent of {{user}}. Quiet moments = ambient texture (light, sound, weather).`,
-    onomatopoeia: `[ONOMATOPOEIA_MODE] Inline sound words: *thud*, *slap*, *squelch*, *crack*. Cap 2-3 per paragraph. For impact beats, not filler.`,
-    hybrid_pov: `[HYBRID_POV] Sensory sequences -> second person ("you feel"). General action/world -> third person ("she leans"). Switch at natural beats, not mid-paragraph. FPP pics: viewer body from bottom of frame only.`,
-    somatic_lock: `[SOMATIC_LOCK ACTIVE] User input has no declared voluntary action. {{user}} body FIXED — forbid voluntary motor. NPCs continue. {{user}} involuntary responses only (shiver/blush/flinch/breath/heartbeat).`,
-};
-
-function detectRatingHighFromHistory() {
-    // Last 2 AI messages — check for explicit/suggestive pic ratings or NSFW lexicon
-    const context = getContext();
-    const chat = context?.chat || [];
-    const aiMsgs = chat.filter(m => !m.is_user).slice(-2);
-    const re = /Explicit adult content|Suggestive content with partial nudity|pussy|cock|cunt|nipples?\s+(exposed|hard|stiff)|breeding|fucking/i;
-    return aiMsgs.some(m => re.test(m.mes || ''));
-}
-
-function detectDomSubLanguageFromHistory() {
-    const context = getContext();
-    const chat = context?.chat || [];
-    const msgs = chat.slice(-3);
-    const re = /\b(dom|sub|kneel|good girl|good boy|master|mistress|sir,|on your knees|punish|obey|command|pet)\b/i;
-    return msgs.some(m => re.test(m.mes || ''));
-}
-
-function detectMultiPartnerActive(data) {
-    const sceneEntry = Object.values(getEntries(data)).find(e => e?.comment === 'VIR_SCENE_INDEX');
-    const scene = parseSceneState(sceneEntry);
-    const activeCount = Array.isArray(scene.active_characters) ? scene.active_characters.length : 0;
-    return activeCount >= 3 && detectRatingHighFromHistory();
-}
-
-function detectAftermathActive(data) {
-    const entry = findCharStateEntry(data);
-    if (!entry) return false;
-    const stateMap = parseCharStateEntry(entry);
-    return Object.values(stateMap).some(s => s?.aftermath > 0);
-}
-
-function detectEdgingActive() {
-    // Heuristic: last AI message contains tension >= 7 + rung >= 5 markers
-    const context = getContext();
-    const chat = context?.chat || [];
-    const lastAI = [...chat].reverse().find(m => !m.is_user);
-    if (!lastAI) return false;
-    const text = lastAI.mes || '';
-    const tensionMatch = text.match(/Scene_Tension:\s*([0-9]+)/);
-    const rungMatch = text.match(/Tension_Rung:\s*([0-9]+)/);
-    const tension = tensionMatch ? parseInt(tensionMatch[1], 10) : 0;
-    const rung = rungMatch ? parseInt(rungMatch[1], 10) : 0;
-    return tension >= 7 && rung >= 5;
-}
-
-async function modeSyncInject() {
-    const st = settings();
-    let setExtensionPrompt;
-    try {
-        const ctx = getContext();
-        setExtensionPrompt = ctx?.setExtensionPrompt || window.setExtensionPrompt;
-    } catch { return; }
-    if (typeof setExtensionPrompt !== 'function') return;
-
-    const set = (key, content) => {
-        try { setExtensionPrompt(`FF4_VIR_${key}`, content || '', 1, 0, false, 'system'); }
-        catch { /* ignore */ }
-    };
-
-    // Agency mode (mutually exclusive)
-    const agency = st.agencyMode || 'auto';
-    set('AGENCY_REACTIVE', agency === 'reactive' ? MODE_SYNC_BLOCKS.agency_reactive : '');
-    set('AGENCY_GUIDED', agency === 'guided' ? MODE_SYNC_BLOCKS.agency_guided : '');
-    // Auto mode: extension's Somatic Lock auto-detection handles dynamic injection per turn
-
-    // User toggles (always-on when enabled)
-    set('CHALLENGE', st.challengeMode ? MODE_SYNC_BLOCKS.challenge : '');
-    set('CYNICISM', st.cynicismAperture ? MODE_SYNC_BLOCKS.cynicism : '');
-    set('CYOA', st.cyoaMode ? MODE_SYNC_BLOCKS.cyoa : '');
-    set('INNER_MONOLOGUE', st.innerMonologueMode ? MODE_SYNC_BLOCKS.inner_monologue : '');
-    set('DYNAMIC_SIM', st.dynamicSimulationMode ? MODE_SYNC_BLOCKS.dynamic_simulation : '');
-    set('ONOMATOPOEIA', st.onomatopoeiaMode ? MODE_SYNC_BLOCKS.onomatopoeia : '');
-    set('HYBRID_POV', st.pov === 'hybrid' ? MODE_SYNC_BLOCKS.hybrid_pov : '');
-
-    // Conditional auto-triggers
-    const worldName = currentWorldName();
-    if (worldName) {
-        try {
-            const data = await loadWorldInfo(worldName);
-            if (data) {
-                set('AFTERMATH', (st.aftermathAutoTrigger && detectAftermathActive(data)) ? MODE_SYNC_BLOCKS.aftermath : '');
-                set('NSFW_LEXICON', (st.nsfwLexiconAutoTrigger && detectRatingHighFromHistory()) ? MODE_SYNC_BLOCKS.nsfw_lexicon : '');
-                set('POWER_DYN', (st.powerDynamicsAutoTrigger && detectDomSubLanguageFromHistory()) ? MODE_SYNC_BLOCKS.power_dynamics : '');
-                set('MULTI_PARTNER', (st.multiPartnerAutoTrigger && detectMultiPartnerActive(data)) ? MODE_SYNC_BLOCKS.multi_partner : '');
-                set('EDGING', (st.edgingAutoTrigger && detectEdgingActive()) ? MODE_SYNC_BLOCKS.edging : '');
+        for (const packet of packets) {
+            const rawHash = hashString(packet.raw);
+            if (processedHashes.has(rawHash) || processedHashes.has(packet.sig)) continue;
+            let sync;
+            try { sync = parsePacket(packet); }
+            catch (e) {
+                // Parse failed even after 4-pass repair. Log + mark as processed +
+                // still strip from chat. Match RPG HUD's behavior: one parse, log
+                // failure if it can't recover, move on.
+                noteSyncStatus(`Packet parse failed: ${e.message}`, [`parse failed: ${e.message}`], true);
+                processedHashes.add(rawHash); processedHashes.add(packet.sig);
+                processedRaw.push(packet.raw);
+                continue;
             }
-        } catch (e) { error('mode-sync', e); }
+            const result = await processSyncPacket(sync);
+            (result.upserted || []).forEach(n => upsertedAll.add(n));
+            processedRaw.push(packet.raw);
+            processedHashes.add(rawHash); processedHashes.add(packet.sig);
+            sessionPacketCount++;
+        }
+        message.extra[EXT].processed = [...processedHashes];
+
+        // Auto-strip — runs even if no packets parsed (catches malformed leftovers)
+        if (settings().autoHideSyncedPackets) {
+            const cleaned = stripVirFromMessage(text, processedRaw);
+            if (cleaned !== text) {
+                message.mes = cleaned;
+                updateMessageBlock(messageId, message);
+            }
+        }
+        try { await context.saveChat(); } catch { /* ignore */ }
+
+        if (processedRaw.length || upsertedAll.size) {
+            const upNote = upsertedAll.size ? ` (${[...upsertedAll].join(', ')})` : '';
+            settings().sessionPacketCount = sessionPacketCount;
+            noteSyncStatus(`Synced ${processedRaw.length} VIR packet(s)${upNote}`);
+        }
+    } catch (e) {
+        error('processMessage failed', e);
+        noteSyncStatus(`VIR sync failed: ${e.message}`, [`failed: ${e.message}`], true);
     }
 }
+async function handleMessage(messageId) {
+    if (!settings().enabled) return;
+    processingQueue = processingQueue.then(() => processMessage(messageId)).catch(e => error('queue', e));
+    processingQueue = processingQueue.then(() => decayRecall()).catch(e => error('decay', e));
+}
 
-// ====================================================================
-// END Peak v3 additions
-// ====================================================================
-
-// ------------------------------------------------------------------
-// Recall decay — decrement remaining turns, drop expired
-// ------------------------------------------------------------------
+// ============================================================================
+// RECALL DECAY
+// ============================================================================
 async function decayRecall() {
     const worldName = currentWorldName();
     if (!worldName) return;
@@ -2418,764 +1358,53 @@ async function decayRecall() {
     }
     if (changed) {
         saveSettingsDebounced();
-        await reapplyTiers();
-    }
-}
-
-// ------------------------------------------------------------------
-// Pre-generation user-input scan — bump matched characters to active
-// ------------------------------------------------------------------
-async function preGenScan() {
-    if (!settings().enabled || !settings().preGenUserScan) return;
-    const worldName = currentWorldName();
-    if (!worldName) return;
-    const data = await loadWorldInfo(worldName);
-    if (!data) return;
-    const context = getContext();
-    const chat = context.chat || [];
-    // Look at the LAST user message and last 3 AI messages
-    const recent = chat.slice(-6).map(m => String(m?.mes || '')).join('\n');
-    if (!recent) return;
-    const recentLower = recent.toLowerCase();
-    const charEntries = characterEntries(data);
-    const matchedNames = [];
-    for (const [, entry] of charEntries) {
-        const name = characterEntryName(entry); if (!name) continue;
-        const allKeys = uniqueClean([name, ...(entry.key || [])]);
-        const hit = allKeys.some(k => k && k.length >= 3 && recentLower.includes(k.toLowerCase()));
-        if (hit) matchedNames.push(name);
-    }
-    if (!matchedNames.length) return;
-    log('pre-gen scan matched:', matchedNames);
-    const st = settings();
-    st.recallCharacters = st.recallCharacters || {};
-    st.recallCharacters[worldName] = st.recallCharacters[worldName] || {};
-    for (const name of matchedNames) {
-        // Bump for 2 turns — short window, just to ensure they're available for next reply
-        st.recallCharacters[worldName][name] = Math.max(st.recallCharacters[worldName][name] || 0, 2);
-    }
-    saveSettingsDebounced();
-    bumpLastActive(data, matchedNames);
-    rebuildRosterEntry(data);
-    await saveWorldInfo(worldName, data, true);
-    await reapplyTiers();
-}
-
-// ------------------------------------------------------------------
-// Pic-tag verifier — soft warn when pic prose doesn't match locked VIR
-// ------------------------------------------------------------------
-async function verifyPicTags(messageId) {
-    const mode = settings().picTagVerify;
-    if (!mode || mode === 'off') return;
-    const context = getContext();
-    const message = context.chat?.[messageId];
-    if (!message || message.is_user) return;
-    const text = String(message.mes || '');
-    if (!text.includes('<pic')) return;
-    const worldName = currentWorldName();
-    if (!worldName) return;
-    const data = await loadWorldInfo(worldName);
-    if (!data) return;
-    const charEntries = characterEntries(data);
-    if (!charEntries.length) return;
-
-    // Build canonical color/feature tokens per character
-    const charVirMap = new Map();
-    for (const [, entry] of charEntries) {
-        const name = characterEntryName(entry); if (!name) continue;
-        charVirMap.set(name, parseActiveVir(entry.content));
-    }
-
-    const picRe = /<pic\s[^>]*prompt=['"]([^'"]*)['"][^>]*>/gi;
-    const warnings = [];
-    let m;
-    while ((m = picRe.exec(text)) !== null) {
-        const promptText = m[1].toLowerCase();
-        for (const [name, vir] of charVirMap.entries()) {
-            const nameLower = name.toLowerCase();
-            if (!promptText.includes(nameLower) && !((vir.aliases || []).some(a => promptText.includes(String(a).toLowerCase())))) continue;
-            // Extract canonical color/feature tokens
-            const hairColor = extractColorToken(vir.hair);
-            const eyeColor = extractColorToken(vir.eyes);
-            const skinTone = extractColorToken(vir.skin_fur_scales);
-            if (hairColor && !promptText.includes(hairColor)) warnings.push(`Pic referencing ${name} missing canonical hair color "${hairColor}"`);
-            if (eyeColor && !promptText.includes(eyeColor)) warnings.push(`Pic referencing ${name} missing canonical eye color "${eyeColor}"`);
-            if (skinTone && !promptText.includes(skinTone)) warnings.push(`Pic referencing ${name} missing canonical skin tone "${skinTone}"`);
+        const data = await loadWorldInfo(worldName);
+        if (data) {
+            const activeNames = new Set();
+            const pinned = new Set(st.pinnedCharacters?.[worldName] || []);
+            const recallSet = new Set(Object.keys(recall));
+            setActiveFlags(data, activeNames, pinned, recallSet);
+            ensureFF4StateEntry(data);
+            await saveWorldInfo(worldName, data, true);
         }
     }
-    if (warnings.length) {
-        noteSyncStatus(`Pic adherence: ${warnings.length} mismatch warning(s)`, warnings);
-        if (mode === 'warn') log('pic-tag verify warnings:', warnings);
-        // Future: 'rewrite' mode could append canonical strings to pic prompt
-    }
 }
 
-function extractColorToken(str) {
-    if (!str) return '';
-    const text = String(str).toLowerCase();
-    // Look for compound color phrases first (e.g., "jet-black", "platinum-blonde", "warm ivory")
-    const compound = text.match(/\b(jet|pitch|ink|coal|raven)-?black|\b(platinum|honey|strawberry|ash)-?blonde|\b(chestnut|chocolate|auburn|copper|caramel|mahogany)-?brown|\b(crimson|scarlet|cherry|wine)-?red|\b(emerald|forest|jade|olive)-?green|\b(sapphire|ice|sky|navy|cobalt)-?blue|\b(lavender|violet|amethyst)-?purple|\b(warm|cool|pale|deep|fair)\s+(ivory|olive|tan|ebony|porcelain|alabaster)\b/i);
-    if (compound) return compound[0].toLowerCase();
-    // Simple color word
-    const simple = text.match(/\b(black|brown|blonde|red|orange|yellow|green|blue|purple|violet|pink|white|gray|grey|silver|gold|platinum|ivory|olive|tan|ebony|porcelain|alabaster)\b/i);
-    return simple ? simple[0].toLowerCase() : '';
-}
-
-// ------------------------------------------------------------------
-// Tier reapply + pin/unpin
-// ------------------------------------------------------------------
-async function reapplyTiers() {
-    const worldName = currentWorldName();
-    if (!worldName) return;
-    const data = await loadWorldInfo(worldName); if (!data) return;
-    const sceneEntry = Object.values(getEntries(data)).find(x => x?.comment === 'VIR_SCENE_INDEX');
-    const scene = parseSceneState(sceneEntry);
-    const recall = settings().recallCharacters?.[worldName] || {};
-    const activeNames = new Set([
-        ...(scene.active_characters || []),
-        ...Object.entries(scene.characters || {}).filter(([, s]) => s?.active !== false).map(([n]) => n),
-        ...Object.keys(recall),
-    ]);
-    const pinnedList = settings().pinnedCharacters?.[worldName] || [];
-    setActiveFlags(data, activeNames, new Set(pinnedList), Boolean(settings().keepAllConstant));
-    ensureBaseEntries(data, scene);
-    await saveWorldInfo(worldName, data, true);
-    await updateWorldInfoList();
-    await activateCurrentWorld();
-}
-
-async function togglePinCharacter(worldName, name) {
-    const st = settings();
-    st.pinnedCharacters = st.pinnedCharacters || {};
-    st.pinnedCharacters[worldName] = st.pinnedCharacters[worldName] || [];
-    const list = st.pinnedCharacters[worldName];
-    const idx = list.indexOf(name);
-    if (idx === -1) list.push(name); else list.splice(idx, 1);
-    saveSettingsDebounced();
-    await reapplyTiers();
-    await renderCharacterList();
-}
-
-// ------------------------------------------------------------------
-// Verify injection (new feature)
-// ------------------------------------------------------------------
-async function verifyInjection() {
-    const worldName = currentWorldName();
-    if (!worldName) return toastr.warning('No active chat.', 'FF4 VIR Sync');
-    if (!(world_names || []).includes(worldName)) return toastr.warning(`Lorebook ${worldName} does not exist yet.`, 'FF4 VIR Sync');
-
-    const wiSettings = getWorldInfoSettings();
-    const global = wiSettings.world_info?.globalSelect || [];
-    const inGlobal = global.includes(worldName);
-    const boundToChat = chat_metadata?.[WI_METADATA_KEY] === worldName;
-
-    const data = await loadWorldInfo(worldName);
-    const entries = data ? Object.values(getEntries(data)) : [];
-    const constantCount = entries.filter(e => e?.constant && !e.disable).length;
-    const charCount = characterEntries(data).length;
-    const charsConstant = characterEntries(data).filter(([, e]) => e.constant && !e.disable).length;
-
-    const report = [
-        `Lorebook: ${worldName}`,
-        `In global active list: ${inGlobal ? 'YES' : 'NO'}`,
-        `Bound to current chat: ${boundToChat ? 'YES' : 'NO'}`,
-        `Total entries: ${entries.length}`,
-        `  Constant + enabled: ${constantCount}`,
-        `  Character entries: ${charCount} (${charsConstant} constant)`,
-        '',
-        constantCount === 0 ? 'WARNING: No constant entries — nothing will be auto-injected.' :
-        !inGlobal ? 'WARNING: Lorebook not in global active list — will not load.' :
-        'OK — lorebook should inject on next prompt.',
-    ].join('\n');
-
-    log(report);
-    toastr.info(report.replace(/\n/g, '<br>'), 'FF4 VIR Injection Check', { escapeHtml: false, timeOut: 15000 });
-    return report;
-}
-
-// ------------------------------------------------------------------
-// Reset / normalize / orphan cleanup
-// ------------------------------------------------------------------
-async function resetCurrentChatVir() {
-    const worldName = currentWorldName();
-    if (!worldName) return toastr.warning('No active chat.', 'FF4 VIR Sync');
-    const ok = await getContext().Popup.show.confirm('Reset current chat VIR?', `This clears ${worldName} character VIR entries. Chat history is unchanged.`);
-    if (!ok) return;
-    const data = { entries: {} };
-    ensureBaseEntries(data, {});
-    await saveWorldInfo(worldName, data, true);
-    await updateWorldInfoList();
-    await activateCurrentWorld();
-    toastr.success('Current chat VIR registry reset.', 'FF4 VIR Sync');
-}
-
-function normalizeWorldData(data) {
-    const entries = getEntries(data);
-    const warnings = [];
-    const seen = new Map();
-    for (const [uid, entry] of characterEntries(data)) {
-        const oldName = characterEntryName(entry);
-        const vir = parseActiveVir(entry.content);
-        const info = canonicalizeName(oldName, { vir, aliases: entry.key || [] });
-        const canonical = info.canonical;
-        warnings.push(...info.warnings);
-        if (seen.has(canonical)) {
-            const target = entries[seen.get(canonical)];
-            const mergedVir = mergeVir(parseActiveVir(target.content), vir);
-            target.key = uniqueClean([...(target.key || []), ...(entry.key || []), oldName, ...info.aliases, canonical]);
-            target.comment = `VIR: ${canonical}`;
-            if (Object.keys(mergedVir || {}).length) target.content = characterContent(canonical, { vir: mergedVir });
-            target.constant = target.constant || entry.constant;
-            delete entries[uid];
-            warnings.push(`Merged duplicate VIR entry "${oldName}" into "${canonical}".`);
-            continue;
-        }
-        seen.set(canonical, uid);
-        entry.key = uniqueClean([canonical, ...(entry.key || []), ...info.aliases]);
-        entry.comment = `VIR: ${canonical}`;
-        if (Object.keys(vir || {}).length) entry.content = characterContent(canonical, { vir });
-        if (oldName !== canonical) warnings.push(`Renamed VIR entry "${oldName}" to "${canonical}".`);
-    }
-    ensureBaseEntries(data);
-    return uniqueClean(warnings);
-}
-
-async function normalizeCurrentVirNames() {
-    const worldName = currentWorldName();
-    if (!worldName) return toastr.warning('No active chat.', 'FF4 VIR Sync');
-    const data = await ensureWorldLoaded(worldName);
-    const before = characterCount(data);
-    const warnings = normalizeWorldData(data);
-    await saveWorldInfo(worldName, data, true);
-    await updateWorldInfoList();
-    await activateCurrentWorld();
-    const after = characterCount(data);
-    noteSyncStatus(`Normalized ${worldName}. Characters: ${before} -> ${after}. ${warnings.length ? `${warnings.length} note(s).` : 'No changes.'}`, warnings);
-    toastr.success(`Normalized current VIR lorebook (${before} -> ${after} characters).`, 'FF4 VIR Sync');
-}
-
-async function cleanupCurrentCharacterOrphans() {
-    const context = getContext();
-    const character = context?.characters?.[context.characterId];
-    if (!character?.avatar) return toastr.warning('No current character selected.', 'FF4 VIR Sync');
-    const response = await fetch('/api/characters/chats', {
-        method: 'POST', headers: getRequestHeaders(),
-        body: JSON.stringify({ avatar_url: character.avatar }),
-    });
-    if (!response.ok) return toastr.warning('Could not read current character chat list.', 'FF4 VIR Sync');
-    const chats = Object.values(await response.json());
-    const existing = new Set(chats.map(c => String(c.file_name || '').replace(/\.jsonl$/i, '')));
-    const mapped = settings().worldChatMap || {};
-    const candidates = (world_names || []).filter(name => {
-        if (!String(name).startsWith(WORLD_PREFIX)) return false;
-        const mappedChat = mapped[name]?.chatId;
-        if (mappedChat) return !existing.has(mappedChat);
-        const stem = String(name).slice(WORLD_PREFIX.length).replace(/-[a-z0-9]+$/i, '');
-        return stem.startsWith(character.name) && !existing.has(stem);
-    });
-    if (!candidates.length) return toastr.info('No orphan VIR lorebooks found for current character.', 'FF4 VIR Sync');
-    const ok = await context.Popup.show.confirm('Delete orphan VIR lorebooks?', `This deletes ${candidates.length} FF4 VIR lorebook(s) whose chat files are not listed for ${character.name}:\n\n${candidates.join('\n')}`);
-    if (!ok) return;
-    let deleted = 0;
-    for (const w of candidates) if (await deleteVirWorld(w)) deleted++;
-    await updateWorldInfoList(); updateStatus();
-    toastr.success(`Deleted ${deleted} orphan VIR lorebook(s).`, 'FF4 VIR Sync');
-}
-
-// ------------------------------------------------------------------
-// Export / Import
-// ------------------------------------------------------------------
-async function exportCurrentVir() {
-    const worldName = currentWorldName();
-    if (!worldName || !(world_names || []).includes(worldName)) return toastr.warning('No VIR lorebook for this chat yet.', 'FF4 VIR Sync');
-    const data = await loadWorldInfo(worldName);
-    const blob = new Blob([JSON.stringify({ world: worldName, exported: new Date().toISOString(), data }, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = `${safeNamePart(worldName)}-vir-export.json`;
-    document.body.appendChild(a); a.click(); a.remove();
-    URL.revokeObjectURL(url);
-    toastr.success(`Exported ${characterCount(data)} characters.`, 'FF4 VIR Sync');
-}
-
-async function importVirFile(file) {
-    if (!file) return;
-    try {
-        const text = await file.text();
-        const parsed = JSON.parse(text);
-        const importedData = parsed.data || parsed;
-        if (!importedData || typeof importedData !== 'object' || !importedData.entries) throw new Error('No entries in import file');
-        const worldName = currentWorldName();
-        if (!worldName) throw new Error('No active chat');
-        // Merge: load current world and upsert each imported character
-        const current = await ensureWorldLoaded(worldName);
-        const importedChars = Object.values(importedData.entries).filter(e => characterEntryName(e));
-        const importedActive = new Set();
-        for (const e of importedChars) {
-            const name = characterEntryName(e); if (!name) continue;
-            const vir = parseActiveVir(e.content);
-            upsertCharacter(current, name, { vir, aliases: e.key || [] }, importedActive);
-        }
-        ensureBaseEntries(current);
-        await saveWorldInfo(worldName, current, true);
-        await updateWorldInfoList();
-        await activateCurrentWorld();
-        toastr.success(`Imported ${importedChars.length} characters into ${worldName}.`, 'FF4 VIR Sync');
-        await renderCharacterList();
-    } catch (e) {
-        error('import failed', e);
-        toastr.warning(`Import failed: ${e.message}`, 'FF4 VIR Sync');
-    }
-}
-
-// ------------------------------------------------------------------
-// UI
-// ------------------------------------------------------------------
-async function renderCharacterList() {
-    const container = document.getElementById('ff4_vir_char_list');
-    if (!container) return;
-    const worldName = currentWorldName();
-    if (!worldName || !(world_names || []).includes(worldName)) {
-        container.innerHTML = '<div class="ff4-vir-muted">No active VIR lorebook. Send a &lt;vir_sync&gt; packet from the AI to create one.</div>';
-        return;
-    }
-    let data; try { data = await loadWorldInfo(worldName); } catch { data = null; }
-    if (!data) { container.innerHTML = '<div class="ff4-vir-muted">Could not load lorebook.</div>'; return; }
-    const entries = characterEntries(data);
-    if (!entries.length) { container.innerHTML = '<div class="ff4-vir-muted">No characters registered yet.</div>'; return; }
-    const sceneEntry = Object.values(getEntries(data)).find(x => x?.comment === 'VIR_SCENE_INDEX');
-    const scene = parseSceneState(sceneEntry);
-    const activeSet = new Set([
-        ...(scene.active_characters || []),
-        ...Object.entries(scene.characters || {}).filter(([, s]) => s?.active !== false).map(([n]) => n),
-    ]);
-    const pinnedSet = new Set(settings().pinnedCharacters?.[worldName] || []);
-    const keepAll = Boolean(settings().keepAllConstant);
-    const rows = entries.map(([, entry]) => {
-        const name = characterEntryName(entry);
-        const isPinned = pinnedSet.has(name);
-        const isActive = activeSet.has(name);
-        const tierLabel = isPinned ? '[PIN]' : isActive ? '[ACT]' : keepAll ? '[ON]' : '[OFF]';
-        const pinLabel = isPinned ? 'Unpin' : 'Pin';
-        const safeName = escapeHtml(name);
-        return `<div class="ff4-vir-char-row" data-name="${safeName}">
-            <span class="ff4-vir-char-tier">${tierLabel}</span>
-            <span class="ff4-vir-char-name">${safeName}</span>
-            <button class="ff4-vir-pin-btn menu_button" data-name="${safeName}">${pinLabel}</button>
-        </div>`;
-    });
-    container.innerHTML = rows.join('');
-    container.querySelectorAll('.ff4-vir-pin-btn').forEach(btn => {
-        btn.addEventListener('click', async () => { await togglePinCharacter(worldName, btn.dataset.name); });
-    });
-
-    // Dup name hint
-    const names = entries.map(([, e]) => characterEntryName(e)).filter(Boolean);
-    const dupPairs = [];
-    for (let i = 0; i < names.length; i++) for (let j = i + 1; j < names.length; j++) {
-        const a = names[i].toLowerCase(), b = names[j].toLowerCase();
-        if (a.startsWith(b) || b.startsWith(a)) { dupPairs.push(`"${names[i]}" / "${names[j]}"`); }
-    }
-    const dupHint = document.getElementById('ff4_vir_dup_hint');
-    if (dupHint) {
-        if (dupPairs.length) { dupHint.style.display = ''; dupHint.textContent = `Possible duplicate names: ${dupPairs.join(', ')} -- click "Normalize" to merge.`; }
-        else dupHint.style.display = 'none';
-    }
-}
-
-async function getCurrentWorldCharacterCount() {
-    const worldName = currentWorldName();
-    if (!worldName || !(world_names || []).includes(worldName)) return 0;
-    try { const data = await loadWorldInfo(worldName); return characterCount(data || {}); } catch { return 0; }
-}
-
-async function updateStatus() {
-    const el = document.getElementById('ff4_vir_current_world');
-    if (el) el.textContent = currentWorldName() || 'No active chat';
-    const countEl = document.getElementById('ff4_vir_character_count');
-    if (countEl) countEl.textContent = String(await getCurrentWorldCharacterCount());
-    const syncEl = document.getElementById('ff4_vir_last_sync');
-    if (syncEl) syncEl.textContent = settings().lastSyncStatus || 'No sync yet';
-    const lastAtEl = document.getElementById('ff4_vir_last_sync_at');
-    if (lastAtEl) {
-        const t = settings().lastSyncAt;
-        lastAtEl.textContent = t ? new Date(t).toLocaleString() : '--';
-    }
-    const sessionEl = document.getElementById('ff4_vir_session_count');
-    if (sessionEl) sessionEl.textContent = String(sessionPacketCount);
-    const errEl = document.getElementById('ff4_vir_last_error');
-    if (errEl) errEl.textContent = settings().lastError || '--';
-    const boundEl = document.getElementById('ff4_vir_bound_to_chat');
-    if (boundEl) {
-        const w = currentWorldName();
-        const bound = chat_metadata?.[WI_METADATA_KEY] === w;
-        boundEl.textContent = bound ? 'YES' : 'NO';
-        boundEl.style.color = bound ? 'var(--success, #6f6)' : 'var(--warning, #d7a900)';
-    }
-    const warningsEl = document.getElementById('ff4_vir_recent_warnings');
-    if (warningsEl) {
-        const ws = settings().recentWarnings || [];
-        warningsEl.innerHTML = ws.length
-            ? ws.map(w => `<div class="ff4-vir-warning">${escapeHtml(w)}</div>`).join('')
-            : '<div class="ff4-vir-muted">No recent warnings.</div>';
-    }
-    const tokenEl = document.getElementById('ff4_vir_token_estimate');
-    if (tokenEl) {
-        const w = currentWorldName();
-        let chars = 0;
-        if (w) {
-            try {
-                const data = await loadWorldInfo(w);
-                if (data) {
-                    for (const e of Object.values(getEntries(data))) {
-                        if (e && (e.constant || e.disable === false)) {
-                            chars += (e.content || '').length;
-                        }
-                    }
-                }
-            } catch { /* ignore */ }
-        }
-        const tokens = Math.round(chars / 3.8); // rough chars-per-token average
-        tokenEl.textContent = `${tokens} (${chars} chars)`;
-        tokenEl.style.color = tokens > 4000 ? 'var(--warning, #d7a900)' : 'var(--success, #6f6)';
-    }
-    await renderCharacterList();
-}
-
-function renderSettings() {
-    if (document.getElementById('ff4_vir_lorebook_sync_settings')) return;
-    $('#extensions_settings').append(`
-<div id="ff4_vir_lorebook_sync_settings" class="extension_container">
-    <div class="inline-drawer">
-        <div class="inline-drawer-toggle inline-drawer-header">
-            <b>FF4 VIR Lorebook Sync v${VERSION}</b>
-            <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
-        </div>
-        <div class="inline-drawer-content">
-            <div class="ff4-vir-row"><label for="ff4_vir_enabled">Enabled</label><input id="ff4_vir_enabled" type="checkbox"></div>
-            <div class="ff4-vir-help">Processes &lt;vir_sync&gt; packets after AI replies and stores visual identity in a per-chat lorebook.</div>
-
-            <div class="ff4-vir-row"><label for="ff4_vir_auto_hide">Auto-hide synced packets</label><input id="ff4_vir_auto_hide" type="checkbox"></div>
-            <div class="ff4-vir-row"><label for="ff4_vir_bind_to_chat">Bind lorebook to chat (per-chat)</label><input id="ff4_vir_bind_to_chat" type="checkbox"></div>
-            <div class="ff4-vir-help">Writes the VIR lorebook to chat metadata so it's auto-loaded when reopening this chat. Recommended ON.</div>
-            <div class="ff4-vir-row"><label for="ff4_vir_keep_all_constant">Keep all characters in context</label><input id="ff4_vir_keep_all_constant" type="checkbox"></div>
-            <div class="ff4-vir-help">ON (default): every known character's VIR always injects. Turn OFF for large casts to rely on roster + recall.</div>
-            <div class="ff4-vir-row"><label for="ff4_vir_use_pic_rules">Inject FF4 Pic Format rules from extension</label><input id="ff4_vir_use_pic_rules" type="checkbox"></div>
-            <div class="ff4-vir-help">ON: pic rules live in the lorebook (slimmer preset). OFF: rely on rules embedded in your preset jailbreak.</div>
-            <div class="ff4-vir-row"><label for="ff4_vir_pre_gen_scan">Auto-recall from user input</label><input id="ff4_vir_pre_gen_scan" type="checkbox"></div>
-            <div class="ff4-vir-help">Before each AI reply, scans recent messages for character names/aliases/items and auto-bumps matches to active.</div>
-            <div class="ff4-vir-row"><label for="ff4_vir_pic_verify">Pic-tag verifier</label>
-                <select id="ff4_vir_pic_verify">
-                    <option value="off">Off</option>
-                    <option value="warn">Warn</option>
-                    <option value="inject">Inject nudge next turn</option>
-                    <option value="rewrite">Surgical rewrite (recommended)</option>
-                </select>
-            </div>
-            <div class="ff4-vir-help">After each AI reply, checks pic prompts contain canonical hair/eye/skin tokens. Rewrite mode surgically inserts missing canonical tokens into offending pic paragraphs.</div>
-
-            <div class="ff4-vir-section">
-                <b>Peak v4 — Watchdogs & State</b>
-                <div class="ff4-vir-row"><label for="ff4_vir_drift_policy">Drift watchdog</label>
-                    <select id="ff4_vir_drift_policy">
-                        <option value="off">Off</option>
-                        <option value="warn">Warn only</option>
-                        <option value="inject">Inject next-turn nudge</option>
-                        <option value="rewrite">Surgical rewrite (recommended)</option>
-                    </select>
-                </div>
-                <div class="ff4-vir-row"><label for="ff4_vir_banned_vocab_policy">Banned vocabulary watchdog</label>
-                    <select id="ff4_vir_banned_vocab_policy">
-                        <option value="off">Off</option>
-                        <option value="warn">Warn only</option>
-                        <option value="inject">Inject next-turn nudge</option>
-                    </select>
-                </div>
-                <div class="ff4-vir-row"><label for="ff4_vir_macro_emotion_policy">Macro-emotion watchdog</label>
-                    <select id="ff4_vir_macro_emotion_policy">
-                        <option value="off">Off</option>
-                        <option value="warn">Warn only</option>
-                        <option value="inject">Inject next-turn nudge</option>
-                    </select>
-                </div>
-                <div class="ff4-vir-row"><label for="ff4_vir_repetition_audit">Anti-repetition audit (last 2 turns)</label><input id="ff4_vir_repetition_audit" type="checkbox"></div>
-                <div class="ff4-vir-row"><label for="ff4_vir_shape_variance">Reply-shape variance tracker</label><input id="ff4_vir_shape_variance" type="checkbox"></div>
-                <div class="ff4-vir-row"><label for="ff4_vir_anti_echo">Anti-echo detector</label><input id="ff4_vir_anti_echo" type="checkbox"></div>
-                <div class="ff4-vir-row"><label for="ff4_vir_female_acoustics">Female voice acoustics guard</label><input id="ff4_vir_female_acoustics" type="checkbox"></div>
-                <div class="ff4-vir-row"><label for="ff4_vir_scene_separation">Scene separation barrier</label><input id="ff4_vir_scene_separation" type="checkbox"></div>
-                <div class="ff4-vir-row"><label for="ff4_vir_somatic_lock">Somatic Lock auto-detect</label><input id="ff4_vir_somatic_lock" type="checkbox"></div>
-                <div class="ff4-vir-row"><label for="ff4_vir_auto_bootstrap">Card auto-bootstrap on empty chats</label><input id="ff4_vir_auto_bootstrap" type="checkbox"></div>
-            </div>
-
-            <div class="ff4-vir-section">
-                <b>Peak v4 — Modes & Conditional Injection</b>
-                <div class="ff4-vir-row"><label for="ff4_vir_agency_mode">Agency mode</label>
-                    <select id="ff4_vir_agency_mode">
-                        <option value="reactive">Reactive (AI never controls user)</option>
-                        <option value="guided">Guided (AI elaborates user's intent)</option>
-                        <option value="auto">Auto (smart detect)</option>
-                    </select>
-                </div>
-                <div class="ff4-vir-row"><label for="ff4_vir_pov">POV</label>
-                    <select id="ff4_vir_pov">
-                        <option value="narrator">Third-person narrator</option>
-                        <option value="omniscient">Third-person omniscient</option>
-                        <option value="second">Second person</option>
-                        <option value="first-direct">First person direct</option>
-                        <option value="first-character">First person character</option>
-                        <option value="hybrid">Hybrid (mixed 2nd/3rd)</option>
-                    </select>
-                </div>
-                <div class="ff4-vir-row"><label for="ff4_vir_tense">Tense</label>
-                    <select id="ff4_vir_tense">
-                        <option value="present">Present</option>
-                        <option value="past">Past</option>
-                    </select>
-                </div>
-                <div class="ff4-vir-row"><label for="ff4_vir_challenge">Challenge mode (no plot armor)</label><input id="ff4_vir_challenge" type="checkbox"></div>
-                <div class="ff4-vir-row"><label for="ff4_vir_cynicism">Cynicism Aperture (harsh world)</label><input id="ff4_vir_cynicism" type="checkbox"></div>
-                <div class="ff4-vir-row"><label for="ff4_vir_cyoa">CYOA mode (3-4 choices per turn)</label><input id="ff4_vir_cyoa" type="checkbox"></div>
-                <div class="ff4-vir-row"><label for="ff4_vir_inner_monologue">Inner monologue [Inner: Name]</label><input id="ff4_vir_inner_monologue" type="checkbox"></div>
-                <div class="ff4-vir-row"><label for="ff4_vir_onomatopoeia">Onomatopoeia (*thud*, *slap*)</label><input id="ff4_vir_onomatopoeia" type="checkbox"></div>
-                <div class="ff4-vir-row"><label for="ff4_vir_dynamic_sim">Dynamic simulation (background life)</label><input id="ff4_vir_dynamic_sim" type="checkbox"></div>
-                <div class="ff4-vir-help">Auto-triggered (extension decides): NSFW lexicon, power dynamics, multi-partner, edging, aftermath. Toggle individual auto-triggers below.</div>
-                <div class="ff4-vir-row"><label for="ff4_vir_nsfw_auto">Auto-inject NSFW lexicon when rating high</label><input id="ff4_vir_nsfw_auto" type="checkbox"></div>
-                <div class="ff4-vir-row"><label for="ff4_vir_power_auto">Auto-inject power dynamics when detected</label><input id="ff4_vir_power_auto" type="checkbox"></div>
-                <div class="ff4-vir-row"><label for="ff4_vir_multi_auto">Auto-inject multi-partner when 3+ active</label><input id="ff4_vir_multi_auto" type="checkbox"></div>
-                <div class="ff4-vir-row"><label for="ff4_vir_edging_auto">Auto-inject edging when tension high</label><input id="ff4_vir_edging_auto" type="checkbox"></div>
-                <div class="ff4-vir-row"><label for="ff4_vir_aftermath_auto">Auto-inject aftermath when active</label><input id="ff4_vir_aftermath_auto" type="checkbox"></div>
-            </div>
-
-            <div class="ff4-vir-section">
-                <b>Peak v4 — World Texture</b>
-                <div class="ff4-vir-row"><label for="ff4_vir_background_life">Background life injector</label><input id="ff4_vir_background_life" type="checkbox"></div>
-                <div class="ff4-vir-row"><label for="ff4_vir_background_life_density">Density (every N turns)</label><input id="ff4_vir_background_life_density" type="number" min="3" max="50" style="width:80px"></div>
-                <div class="ff4-vir-row"><label for="ff4_vir_off_screen_events">Off-screen event generator</label><input id="ff4_vir_off_screen_events" type="checkbox"></div>
-                <div class="ff4-vir-row"><label for="ff4_vir_off_screen_events_density">Density (every N turns)</label><input id="ff4_vir_off_screen_events_density" type="number" min="3" max="50" style="width:80px"></div>
-                <div class="ff4-vir-row"><label for="ff4_vir_world_clock">World clock advance</label><input id="ff4_vir_world_clock" type="checkbox"></div>
-            </div>
-
-            <div class="ff4-vir-row"><label for="ff4_vir_debug">Debug</label><input id="ff4_vir_debug" type="checkbox"></div>
-            <div class="ff4-vir-row"><label for="ff4_vir_cleanup_delete">Clean VIR when chat is deleted</label><input id="ff4_vir_cleanup_delete" type="checkbox"></div>
-
-            <div class="ff4-vir-status">
-                <div>Current VIR lorebook: <span id="ff4_vir_current_world"></span></div>
-                <div>Bound to current chat: <span id="ff4_vir_bound_to_chat">--</span></div>
-                <div>Character entries: <span id="ff4_vir_character_count">0</span></div>
-                <div>Last sync: <span id="ff4_vir_last_sync">No sync yet</span> (<span id="ff4_vir_last_sync_at">--</span>)</div>
-                <div>Session packets processed: <span id="ff4_vir_session_count">0</span></div>
-                <div>Last error: <span id="ff4_vir_last_error">--</span></div>
-                <div>VIR context cost (approx): <span id="ff4_vir_token_estimate">--</span> tokens</div>
-            </div>
-
-            <div class="ff4-vir-section">
-                <b>Characters</b>
-                <div class="ff4-vir-help">[PIN]=pinned (Tier A, depth 1). [ACT]=scene-active. [ON]=always on (keep-all). [OFF]=keyword-only.</div>
-                <div id="ff4_vir_char_list" class="ff4-vir-char-list"><div class="ff4-vir-muted">Loading...</div></div>
-                <button id="ff4_vir_refresh_chars" class="menu_button">Refresh Character List</button>
-            </div>
-
-            <div class="ff4-vir-audit">
-                <b>Recent quality warnings</b>
-                <div id="ff4_vir_recent_warnings"></div>
-                <div id="ff4_vir_dup_hint" class="ff4-vir-warning" style="display:none"></div>
-            </div>
-
-            <div class="ff4-vir-buttons">
-                <button id="ff4_vir_activate" class="menu_button">Activate / Bind</button>
-                <button id="ff4_vir_verify" class="menu_button">Verify Injection</button>
-                <button id="ff4_vir_normalize" class="menu_button">Normalize Names</button>
-                <button id="ff4_vir_clear_warnings" class="menu_button">Clear Warnings</button>
-                <button id="ff4_vir_export" class="menu_button">Export VIR</button>
-                <label for="ff4_vir_import" class="menu_button">Import VIR</label>
-                <input id="ff4_vir_import" type="file" accept="application/json" style="display:none">
-                <button id="ff4_vir_cleanup_orphans" class="menu_button">Clean Orphans</button>
-                <button id="ff4_vir_reset" class="menu_button danger_button">Reset Current Chat VIR</button>
-            </div>
-        </div>
-    </div>
-</div>`);
-
-    const wire = (id, prop, cb) => {
-        const el = $(id); el.prop('checked', settings()[prop]).on('change', function () {
-            settings()[prop] = Boolean(this.checked);
-            saveSettingsDebounced();
-            if (cb) cb();
-        });
-    };
-    wire('#ff4_vir_enabled', 'enabled', async () => {
-        if (settings().enabled) await activateCurrentWorld(); else deactivateVirWorlds();
-    });
-    wire('#ff4_vir_auto_hide', 'autoHideSyncedPackets');
-    wire('#ff4_vir_bind_to_chat', 'bindToChat', async () => {
-        if (settings().bindToChat) await activateCurrentWorld();
-    });
-    wire('#ff4_vir_keep_all_constant', 'keepAllConstant', async () => {
-        await reapplyTiers(); await renderCharacterList();
-    });
-    wire('#ff4_vir_use_pic_rules', 'usePicRules', async () => {
-        if (settings().usePicRules) await activateCurrentWorld();
-        else {
-            // Remove the pic rules entry from the lorebook
-            const wn = currentWorldName();
-            if (wn) {
-                const data = await loadWorldInfo(wn);
-                if (data) {
-                    const entries = getEntries(data);
-                    for (const [uid, e] of Object.entries(entries)) if (e?.comment === 'FF4 Pic Format') delete entries[uid];
-                    await saveWorldInfo(wn, data, true);
-                    await updateWorldInfoList();
-                }
-            }
-        }
-    });
-    wire('#ff4_vir_pre_gen_scan', 'preGenUserScan');
-    $('#ff4_vir_pic_verify').val(settings().picTagVerify || 'warn').on('change', function () {
-        settings().picTagVerify = this.value;
-        saveSettingsDebounced();
-    });
-    // Peak v4 watchdog controls
-    const wireSelect = (id, prop, def) => {
-        $(id).val(settings()[prop] || def).on('change', function () {
-            settings()[prop] = this.value;
-            saveSettingsDebounced();
-            modeSyncInject().catch(e => error('mode-sync', e));
-        });
-    };
-    wireSelect('#ff4_vir_drift_policy', 'driftPolicy', 'rewrite');
-    wireSelect('#ff4_vir_banned_vocab_policy', 'bannedVocabPolicy', 'inject');
-    wireSelect('#ff4_vir_macro_emotion_policy', 'macroEmotionPolicy', 'warn');
-    wire('#ff4_vir_repetition_audit', 'repetitionAuditEnabled');
-    wire('#ff4_vir_shape_variance', 'shapeVarianceEnabled');
-    wire('#ff4_vir_anti_echo', 'antiEchoEnabled');
-    wire('#ff4_vir_female_acoustics', 'femaleAcousticsGuard');
-    wire('#ff4_vir_scene_separation', 'sceneSeparationEnabled');
-    wire('#ff4_vir_somatic_lock', 'somaticLockAutoDetect');
-    wire('#ff4_vir_auto_bootstrap', 'autoBootstrapEnabled');
-    // Modes
-    wireSelect('#ff4_vir_agency_mode', 'agencyMode', 'auto');
-    wireSelect('#ff4_vir_pov', 'pov', 'narrator');
-    wireSelect('#ff4_vir_tense', 'tense', 'present');
-    const wireMode = (id, prop) => {
-        $(id).prop('checked', !!settings()[prop]).on('change', function () {
-            settings()[prop] = !!this.checked;
-            saveSettingsDebounced();
-            modeSyncInject().catch(e => error('mode-sync', e));
-        });
-    };
-    wireMode('#ff4_vir_challenge', 'challengeMode');
-    wireMode('#ff4_vir_cynicism', 'cynicismAperture');
-    wireMode('#ff4_vir_cyoa', 'cyoaMode');
-    wireMode('#ff4_vir_inner_monologue', 'innerMonologueMode');
-    wireMode('#ff4_vir_onomatopoeia', 'onomatopoeiaMode');
-    wireMode('#ff4_vir_dynamic_sim', 'dynamicSimulationMode');
-    wireMode('#ff4_vir_nsfw_auto', 'nsfwLexiconAutoTrigger');
-    wireMode('#ff4_vir_power_auto', 'powerDynamicsAutoTrigger');
-    wireMode('#ff4_vir_multi_auto', 'multiPartnerAutoTrigger');
-    wireMode('#ff4_vir_edging_auto', 'edgingAutoTrigger');
-    wireMode('#ff4_vir_aftermath_auto', 'aftermathAutoTrigger');
-    // World texture
-    wire('#ff4_vir_background_life', 'backgroundLifeEnabled');
-    $('#ff4_vir_background_life_density').val(settings().backgroundLifeDensity || 10).on('change', function () {
-        settings().backgroundLifeDensity = parseInt(this.value, 10) || 10;
-        saveSettingsDebounced();
-    });
-    wire('#ff4_vir_off_screen_events', 'offScreenEventsEnabled');
-    $('#ff4_vir_off_screen_events_density').val(settings().offScreenEventsDensity || 12).on('change', function () {
-        settings().offScreenEventsDensity = parseInt(this.value, 10) || 12;
-        saveSettingsDebounced();
-    });
-    wire('#ff4_vir_world_clock', 'worldClockEnabled');
-    wire('#ff4_vir_debug', 'debug');
-    wire('#ff4_vir_cleanup_delete', 'cleanupOnChatDelete');
-
-    $('#ff4_vir_activate').on('click', activateCurrentWorld);
-    $('#ff4_vir_verify').on('click', verifyInjection);
-    $('#ff4_vir_normalize').on('click', normalizeCurrentVirNames);
-    $('#ff4_vir_clear_warnings').on('click', () => {
-        settings().recentWarnings = []; settings().lastError = '';
-        saveSettingsDebounced(); updateStatus();
-    });
-    $('#ff4_vir_export').on('click', exportCurrentVir);
-    $('#ff4_vir_import').on('change', function () { importVirFile(this.files?.[0]); this.value = ''; });
-    $('#ff4_vir_cleanup_orphans').on('click', cleanupCurrentCharacterOrphans);
-    $('#ff4_vir_reset').on('click', resetCurrentChatVir);
-    $('#ff4_vir_refresh_chars').on('click', renderCharacterList);
-    updateStatus();
-}
-
-// ------------------------------------------------------------------
-// Bootstrap
-// ------------------------------------------------------------------
-jQuery(async () => {
-    settings();
-    renderSettings();
-    eventSource.on(event_types.CHAT_CHANGED, async () => {
-        await activateCurrentWorld();
-        await autoBootstrapCardIfEmpty().catch(e => error('auto-bootstrap', e));
-        await handleGroupChat().catch(e => error('group-chat', e));
-        await modeSyncInject().catch(e => error('mode-sync', e));
-        await injectWorldTexture().catch(e => error('world-texture', e));
-    });
-    eventSource.on(event_types.CHAT_DELETED, cleanupVirForDeletedChat);
-    eventSource.on(event_types.GROUP_CHAT_DELETED, cleanupVirForDeletedChat);
-    eventSource.on(event_types.MESSAGE_RECEIVED, handleMessage);
-    eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, handleMessage);
-    // Pre-gen scan: fires when user submits a message, before AI generation
-    if (event_types.MESSAGE_SENT) eventSource.on(event_types.MESSAGE_SENT, () => {
-        preGenScan().catch(e => error('pre-gen', e));
-        injectSomaticLockIfNeeded().catch(e => error('somatic-lock', e));
-    });
-    if (event_types.GENERATION_STARTED) eventSource.on(event_types.GENERATION_STARTED, () => {
-        preGenScan().catch(e => error('pre-gen', e));
-        injectSomaticLockIfNeeded().catch(e => error('somatic-lock', e));
-    });
-    registerSlashCommands();
-    await activateCurrentWorld();
-    log(`v${VERSION} initialized`);
-});
-
-// ------------------------------------------------------------------
-// Slash commands
-// ------------------------------------------------------------------
+// ============================================================================
+// SLASH COMMANDS (minimal — 5 essentials)
+// ============================================================================
 async function registerSlashCommands() {
     try {
         const mod = await import('../../../slash-commands.js');
         const parser = mod.SlashCommandParser?.commands ? mod.SlashCommandParser : null;
-        if (!parser) { log('slash command parser not available'); return; }
-
+        if (!parser) return;
         const reg = (name, callback, helpText) => {
             try {
-                parser.addCommandObject?.({
-                    name, callback, helpString: helpText,
-                });
-            } catch (e) {
-                // Fallback for older API: registerSlashCommand
+                parser.addCommandObject?.({ name, callback, helpString: helpText });
+            } catch {
                 if (typeof window.registerSlashCommand === 'function') {
                     window.registerSlashCommand(name, callback, [], helpText, true, true);
                 }
             }
         };
-
         const recall = async (args, value) => {
             const name = String(value || '').trim();
-            if (!name) return 'Usage: /vir-recall <CharacterName>';
+            if (!name) return 'Usage: /vir-recall <Name>';
             const worldName = currentWorldName();
             if (!worldName) return 'No active chat.';
             const canonical = canonicalizeName(name).canonical;
+            const turns = parseInt(args?.turns) || settings().recallTurnsDefault || 8;
             const st = settings();
-            const turns = parseInt(args?.turns) || st.recallTurnsDefault || 5;
             st.recallCharacters = st.recallCharacters || {};
             st.recallCharacters[worldName] = st.recallCharacters[worldName] || {};
             st.recallCharacters[worldName][canonical] = turns;
             saveSettingsDebounced();
             await reapplyTiers();
-            toastr.info(`Recalled ${canonical} for ${turns} turns.`, 'FF4 VIR');
-            return '';
+            return `Recalled ${canonical} for ${turns} turns.`;
         };
-        const summon = async (args, value) => {
+        const pin = async (args, value) => {
             const name = String(value || '').trim();
-            if (!name) return 'Usage: /vir-summon <CharacterName>';
+            if (!name) return 'Usage: /vir-pin <Name>';
             const worldName = currentWorldName();
             if (!worldName) return 'No active chat.';
             const canonical = canonicalizeName(name).canonical;
@@ -3185,12 +1414,11 @@ async function registerSlashCommands() {
             if (!st.pinnedCharacters[worldName].includes(canonical)) st.pinnedCharacters[worldName].push(canonical);
             saveSettingsDebounced();
             await reapplyTiers();
-            toastr.info(`Summoned ${canonical} (pinned to active).`, 'FF4 VIR');
-            return '';
+            return `Pinned ${canonical} (Tier A, always active).`;
         };
         const park = async (args, value) => {
             const name = String(value || '').trim();
-            if (!name) return 'Usage: /vir-park <CharacterName>';
+            if (!name) return 'Usage: /vir-park <Name>';
             const worldName = currentWorldName();
             if (!worldName) return 'No active chat.';
             const canonical = canonicalizeName(name).canonical;
@@ -3203,209 +1431,334 @@ async function registerSlashCommands() {
             }
             saveSettingsDebounced();
             await reapplyTiers();
-            toastr.info(`Parked ${canonical} (no longer pinned/recalled).`, 'FF4 VIR');
-            return '';
+            return `Parked ${canonical} (offscreen, keyword-only).`;
         };
-        const status = async () => {
+        const list = async () => {
             const worldName = currentWorldName();
             if (!worldName) return 'No active chat.';
             const data = await loadWorldInfo(worldName);
             if (!data) return 'No lorebook.';
-            const entries = characterEntries(data);
-            const ledger = getLastActiveLedger(data);
-            const pinned = new Set(settings().pinnedCharacters?.[worldName] || []);
-            const recall = settings().recallCharacters?.[worldName] || {};
-            const lines = [`VIR status for ${worldName}:`];
-            for (const [, e] of entries) {
-                const name = characterEntryName(e); if (!name) continue;
-                const tier = pinned.has(name) ? 'PINNED' : recall[name] ? `RECALL(${recall[name]})` : (e.constant && !e.disable ? 'ACTIVE' : 'OFFSCREEN');
-                const lastAt = ledger[name] || 0;
-                lines.push(`  ${name}: ${tier} (last active turn ${lastAt})`);
+            const chars = characterEntries(data);
+            if (!chars.length) return 'No characters registered.';
+            const st = settings();
+            const pinned = new Set(st.pinnedCharacters?.[worldName] || []);
+            const recall = st.recallCharacters?.[worldName] || {};
+            const lines = [`VIR Characters (${chars.length}):`];
+            for (const [, entry] of chars) {
+                const name = characterEntryName(entry);
+                let tier = entry.constant ? (pinned.has(name) ? '[PIN]' : (recall[name] ? `[RECALL:${recall[name]}t]` : '[ACT]')) : '[OFF]';
+                lines.push(`  ${tier} ${name}`);
             }
             return lines.join('\n');
         };
-        const audit = async () => {
+        const status = async () => {
             const worldName = currentWorldName();
-            if (!worldName) return 'No active chat.';
-            const data = await loadWorldInfo(worldName);
-            if (!data) return 'No lorebook.';
-            const all = [];
-            for (const [, entry] of characterEntries(data)) {
-                const name = characterEntryName(entry); if (!name) continue;
-                const vir = parseActiveVir(entry.content);
-                all.push(...assertImageReadyVir(name, { vir }, { includeRecommended: true }));
-            }
-            return `VIR audit: ${all.length} issue(s).\n${all.slice(0, 30).join('\n')}`;
+            const st = settings();
+            const lines = [
+                `FF4 VIR v${VERSION}`,
+                `Enabled: ${st.enabled}`,
+                `Smart tiers: ${st.smartTiers !== false}`,
+                `Contract injection: ${st.contractInjection !== false}`,
+                `Current world: ${worldName || 'none'}`,
+                `Session packets: ${sessionPacketCount}`,
+                `Last sync: ${st.lastSyncStatus}`,
+            ];
+            return lines.join('\n');
         };
-
-        reg('vir-recall', recall, 'Recall a character to active for N turns. Usage: /vir-recall Fern');
-        reg('vir-summon', summon, 'Pin a character so they stay in context. Usage: /vir-summon Fern');
-        reg('vir-park',   park,   'Unpin/clear recall for a character. Usage: /vir-park Fern');
-        reg('vir-status', status, 'Show tier and last-active info for all known characters.');
-        reg('vir-audit',  audit,  'Run full quality scan on current VIR lorebook.');
-
-        // Peak v4 — direct state mutations
-        const charStateUpdate = async (name, mutation) => {
-            const worldName = currentWorldName();
-            if (!worldName) return 'No active chat.';
-            const data = await loadWorldInfo(worldName);
-            if (!data) return 'No lorebook.';
-            const canon = canonicalizeName(name).canonical;
-            const stateEntry = findCharStateEntry(data);
-            const map = parseCharStateEntry(stateEntry);
-            map[canon] = { ...(map[canon] || {}), ...mutation };
-            ensureCharStateEntry(data, map);
-            await saveWorldInfo(worldName, data, true);
-            await updateWorldInfoList();
-            return `Updated ${canon}: ${Object.entries(mutation).map(([k, v]) => `${k}=${v}`).join(', ')}`;
-        };
-        const undress = async (args, value) => {
-            const parts = String(value || '').trim().split(/\s+/, 2);
-            if (parts.length < 2) return 'Usage: /vir-undress <Name> <state> (e.g., /vir-undress Marah shirt=torn-open)';
-            return await charStateUpdate(parts[0], { outfit_layers: parts.slice(1).join(' ') });
-        };
-        const injure = async (args, value) => {
-            const parts = String(value || '').trim().split(/\s+/, 2);
-            if (parts.length < 2) return 'Usage: /vir-injure <Name> <injury> (e.g., /vir-injure Ymir bruise=left-hip)';
-            return await charStateUpdate(parts[0], { injuries: parts.slice(1).join(' ') });
-        };
-        const fluids = async (args, value) => {
-            const parts = String(value || '').trim().split(/\s+/, 2);
-            if (parts.length < 2) return 'Usage: /vir-fluids <Name> <state> (e.g., /vir-fluids Marah slick=thighs)';
-            return await charStateUpdate(parts[0], { body_fluids: parts.slice(1).join(' ') });
-        };
-        const mood = async (args, value) => {
-            const parts = String(value || '').trim().split(/\s+/, 5);
-            if (parts.length < 2) return 'Usage: /vir-mood <Name> V=±N A=±N D=±N register (e.g., /vir-mood Marah V0 A+3 D-2 defensive)';
-            const mutation = {};
-            const vad = {};
-            const regs = [];
-            for (const p of parts.slice(1)) {
-                const m = p.match(/^([VAD])([+-]?\d+)$/i);
-                if (m) vad[m[1].toUpperCase()] = parseInt(m[2], 10);
-                else regs.push(p);
-            }
-            if (Object.keys(vad).length) mutation.vad = vad;
-            if (regs.length) mutation.register = regs.join(' ');
-            return await charStateUpdate(parts[0], mutation);
-        };
-        const aftermathCmd = async (args, value) => {
-            const parts = String(value || '').trim().split(/\s+/, 2);
-            if (parts.length < 1) return 'Usage: /vir-aftermath <Name> [turns=3]';
-            const turns = parseInt(parts[1], 10) || settings().aftermathWindowDefault || 3;
-            return await charStateUpdate(parts[0], { aftermath: turns });
-        };
-        const decay = async () => {
-            await decayCharStates();
-            return 'CHAR_STATE decay tick applied.';
-        };
-        const relationshipCmd = async (args, value) => {
-            const parts = String(value || '').trim().split(/\s+/);
-            if (parts.length < 3) return 'Usage: /vir-relationship <A> <B> <status> (e.g., /vir-relationship Marah Ymir jealous)';
-            const worldName = currentWorldName();
-            if (!worldName) return 'No active chat.';
-            const data = await loadWorldInfo(worldName);
-            if (!data) return 'No lorebook.';
-            const a = canonicalizeName(parts[0]).canonical;
-            const b = canonicalizeName(parts[1]).canonical;
-            const status = parts.slice(2).join(' ');
-            const relEntry = findRelationshipsEntry(data);
-            const existing = relEntry ? (() => {
-                const out = {};
-                const m = String(relEntry.content || '').match(/\[RELATIONSHIPS\]([\s\S]*?)\[\/RELATIONSHIPS\]/);
-                if (m) for (const line of m[1].split('\n')) {
-                    const lm = line.match(/^([^:]+):\s*(.+)$/);
-                    if (lm) out[lm[1].trim()] = lm[2].trim();
-                }
-                return out;
-            })() : {};
-            existing[`${a}->${b}`] = status;
-            ensureRelationshipsEntry(data, existing);
-            await saveWorldInfo(worldName, data, true);
-            return `${a} -> ${b}: ${status}`;
-        };
-        const modeCmd = async (args, value) => {
-            const v = String(value || '').trim().toLowerCase();
-            if (!['reactive', 'guided', 'auto'].includes(v)) return 'Usage: /vir-mode reactive|guided|auto';
-            settings().agencyMode = v;
-            saveSettingsDebounced();
-            await modeSyncInject();
-            return `Agency mode = ${v}`;
-        };
-        const povCmd = async (args, value) => {
-            const v = String(value || '').trim().toLowerCase();
-            const valid = ['narrator', 'omniscient', 'second', 'first-direct', 'first-character', 'hybrid'];
-            if (!valid.includes(v)) return `Usage: /vir-pov ${valid.join('|')}`;
-            settings().pov = v;
-            saveSettingsDebounced();
-            await modeSyncInject();
-            return `POV = ${v}`;
-        };
-        const tenseCmd = async (args, value) => {
-            const v = String(value || '').trim().toLowerCase();
-            if (!['present', 'past'].includes(v)) return 'Usage: /vir-tense present|past';
-            settings().tense = v;
-            saveSettingsDebounced();
-            return `Tense = ${v}`;
-        };
-        const toggleCmd = (prop, label) => async (args, value) => {
-            const v = String(value || '').trim().toLowerCase();
-            let next;
-            if (v === 'on' || v === 'true' || v === '1') next = true;
-            else if (v === 'off' || v === 'false' || v === '0') next = false;
-            else next = !settings()[prop];
-            settings()[prop] = next;
-            saveSettingsDebounced();
-            await modeSyncInject();
-            return `${label} = ${next ? 'ON' : 'OFF'}`;
-        };
-        const worldClockCmd = async (args, value) => {
-            const v = String(value || '').trim();
-            const worldName = currentWorldName();
-            if (!worldName) return 'No active chat.';
-            const data = await loadWorldInfo(worldName);
-            if (!data) return 'No lorebook.';
-            const sceneEntry = Object.values(getEntries(data)).find(x => x?.comment === 'VIR_SCENE_INDEX');
-            const scene = parseSceneState(sceneEntry);
-            scene.time = v || scene.time;
-            ensureBaseEntries(data, scene);
-            ensureFF4StateEntry(data);
-            await saveWorldInfo(worldName, data, true);
-            return `World clock advanced to: ${scene.time}`;
-        };
-        const eventCmd = async (args, value) => {
-            const evt = String(value || '').trim();
-            if (!evt) return 'Usage: /vir-event <off-screen event description>';
-            try {
-                const ctx = getContext();
-                const sep = ctx?.setExtensionPrompt || window.setExtensionPrompt;
-                if (typeof sep !== 'function') return 'setExtensionPrompt unavailable.';
-                sep('FF4_VIR_USER_EVENT', `[OFF-SCREEN] ${evt}`, 1, 0, false, 'system');
-                return `Off-screen event injected: "${evt}" (1 turn)`;
-            } catch (e) { return `Error: ${e.message}`; }
-        };
-
-        reg('vir-undress',      undress,          'Set outfit state. /vir-undress <Name> <state>');
-        reg('vir-injure',       injure,           'Set injury. /vir-injure <Name> <injury>');
-        reg('vir-fluids',       fluids,           'Set body fluids. /vir-fluids <Name> <state>');
-        reg('vir-mood',         mood,             'Set VAD + register. /vir-mood <Name> V±N A±N D±N register');
-        reg('vir-aftermath',    aftermathCmd,     'Stamp aftermath window. /vir-aftermath <Name> [turns]');
-        reg('vir-decay',        decay,            'Manually tick CHAR_STATE decay (aftermath etc).');
-        reg('vir-relationship', relationshipCmd,  'Set relationship status. /vir-relationship <A> <B> <status>');
-        reg('vir-mode',         modeCmd,          'Set agency mode. /vir-mode reactive|guided|auto');
-        reg('vir-pov',          povCmd,           'Set POV. /vir-pov narrator|omniscient|second|first-direct|first-character|hybrid');
-        reg('vir-tense',        tenseCmd,         'Set tense. /vir-tense present|past');
-        reg('vir-challenge',    toggleCmd('challengeMode', 'Challenge mode'), 'Toggle Challenge mode. /vir-challenge [on|off]');
-        reg('vir-cynicism',     toggleCmd('cynicismAperture', 'Cynicism'),    'Toggle Cynicism. /vir-cynicism [on|off]');
-        reg('vir-cyoa',         toggleCmd('cyoaMode', 'CYOA'),                'Toggle CYOA. /vir-cyoa [on|off]');
-        reg('vir-inner',        toggleCmd('innerMonologueMode', 'Inner monologue'), 'Toggle Inner Monologue. /vir-inner [on|off]');
-        reg('vir-onomatopoeia', toggleCmd('onomatopoeiaMode', 'Onomatopoeia'), 'Toggle Onomatopoeia. /vir-onomatopoeia [on|off]');
-        reg('vir-dynamic-sim',  toggleCmd('dynamicSimulationMode', 'Dynamic Sim'), 'Toggle Dynamic Simulation. /vir-dynamic-sim [on|off]');
-        reg('vir-world-clock',  worldClockCmd,    'Advance world clock. /vir-world-clock <new time>');
-        reg('vir-event',        eventCmd,         'Inject one-turn off-screen event. /vir-event <description>');
-
-        log('slash commands registered');
+        reg('vir-recall', recall, 'Recall a character for N turns. Usage: /vir-recall <Name>');
+        reg('vir-pin',    pin,    'Pin a character to Tier A (always active). Usage: /vir-pin <Name>');
+        reg('vir-park',   park,   'Unpin/clear recall. Usage: /vir-park <Name>');
+        reg('vir-list',   list,   'List all VIR characters with their tier.');
+        reg('vir-status', status, 'Show FF4 VIR extension status.');
+        log('Slash commands registered');
     } catch (e) {
-        warn('slash command registration failed', e);
+        warn('Slash command registration failed', e);
     }
 }
+
+async function reapplyTiers() {
+    const worldName = currentWorldName();
+    if (!worldName) return;
+    const data = await loadWorldInfo(worldName);
+    if (!data) return;
+    const st = settings();
+    const pinned = new Set(st.pinnedCharacters?.[worldName] || []);
+    const recall = new Set(Object.keys(st.recallCharacters?.[worldName] || {}));
+    const sceneEntry = Object.values(getEntries(data)).find(e => e?.comment === 'FF4 SCENE_STATE');
+    const scene = parseSceneState(sceneEntry);
+    const active = new Set(scene.active_characters || []);
+    setActiveFlags(data, active, pinned, recall);
+    ensureFF4StateEntry(data);
+    rebuildRosterEntry(data);
+    await saveWorldInfo(worldName, data, true);
+    await updateWorldInfoList();
+}
+
+// ============================================================================
+// UI
+// ============================================================================
+function escapeHtml(str) {
+    return String(str).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+}
+function $(id) { return document.getElementById(id); }
+
+function renderSettings() {
+    if ($('ff4_vir_settings')) return;
+    $('extensions_settings')?.insertAdjacentHTML('beforeend', `
+        <div id="ff4_vir_settings" class="ff4-vir-panel">
+            <div class="inline-drawer">
+                <div class="inline-drawer-toggle inline-drawer-header">
+                    <b>FF4 VIR Lorebook Sync</b>
+                    <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+                </div>
+                <div class="inline-drawer-content">
+                    <div class="ff4-vir-subtitle">v${VERSION} — Dynamic character tracking · Auto-injected contract</div>
+
+                    <label class="ff4-vir-tog" title="Master toggle. Disabling stops all extension activity."><input id="ff4_vir_enabled" type="checkbox"> <span>Enabled</span></label>
+                    <label class="ff4-vir-tog" title="Smart tiers: only scene-active + pinned + recalled chars inject as constant. Offscreen chars are keyword-only (zero token cost until name appears in chat)."><input id="ff4_vir_smart_tiers" type="checkbox"> <span>Smart dynamic tiers (recommended)</span></label>
+                    <label class="ff4-vir-tog" title="Strip the AI's emitted vir packet from the visible chat so prose stays clean."><input id="ff4_vir_auto_hide" type="checkbox"> <span>Auto-hide synced packets</span></label>
+                    <label class="ff4-vir-tog" title="Inject the VIR contract + current world state into every generation. Like RPG HUD — no preset edit needed."><input id="ff4_vir_contract" type="checkbox"> <span>Auto-inject contract + state</span></label>
+
+                    <details class="ff4-vir-advanced">
+                        <summary>Advanced</summary>
+                        <label class="ff4-vir-tog"><input id="ff4_vir_bind_to_chat" type="checkbox"> <span>Bind lorebook to current chat</span></label>
+                        <label class="ff4-vir-tog"><input id="ff4_vir_cleanup_delete" type="checkbox"> <span>Delete VIR lorebook when chat deleted</span></label>
+                        <label class="ff4-vir-tog"><input id="ff4_vir_debug" type="checkbox"> <span>Debug logging</span></label>
+                    </details>
+
+                    <div class="ff4-vir-status">
+                        <div><b>World:</b> <span id="ff4_vir_current_world">--</span></div>
+                        <div><b>Bound:</b> <span id="ff4_vir_bound">--</span> · <b>Chars:</b> <span id="ff4_vir_char_count">0</span> · <b>Session:</b> <span id="ff4_vir_session_count">0</span></div>
+                        <div><b>Tokens:</b> <span id="ff4_vir_token_estimate">--</span></div>
+                        <div><b>Last:</b> <span id="ff4_vir_last_sync" class="ff4-vir-muted">No sync yet</span></div>
+                    </div>
+
+                    <details class="ff4-vir-chars" open>
+                        <summary>Characters <span class="ff4-vir-muted ff4-vir-tier-legend">PIN · ACT · RCL · OFF</span></summary>
+                        <div id="ff4_vir_char_list" class="ff4-vir-char-list"><div class="ff4-vir-muted">Loading...</div></div>
+                    </details>
+
+                    <details class="ff4-vir-warnings">
+                        <summary>Recent warnings (<span id="ff4_vir_warn_count">0</span>)</summary>
+                        <div id="ff4_vir_warnings"></div>
+                    </details>
+
+                    <div class="ff4-vir-buttons">
+                        <button id="ff4_vir_activate" class="menu_button" title="Force re-activate VIR lorebook in ST's Active Worlds list">⚓ Activate</button>
+                        <button id="ff4_vir_refresh" class="menu_button">⟳ Refresh</button>
+                        <button id="ff4_vir_clear_warn" class="menu_button">Clear</button>
+                        <button id="ff4_vir_export" class="menu_button">⬇ Export</button>
+                        <label for="ff4_vir_import" class="menu_button">⬆ Import</label>
+                        <input id="ff4_vir_import" type="file" accept="application/json" style="display:none">
+                        <button id="ff4_vir_reset" class="menu_button danger_button">⌫ Reset</button>
+                    </div>
+                </div>
+            </div>
+        </div>`);
+
+    const wire = (id, prop, cb) => {
+        const el = $(id); if (!el) return;
+        el.checked = !!settings()[prop];
+        el.addEventListener('change', function () {
+            settings()[prop] = Boolean(this.checked);
+            saveSettingsDebounced();
+            if (cb) cb();
+        });
+    };
+    wire('ff4_vir_enabled', 'enabled', async () => {
+        if (settings().enabled) await activateCurrentWorld();
+        else clearVirContract();
+    });
+    wire('ff4_vir_auto_hide', 'autoHideSyncedPackets');
+    wire('ff4_vir_smart_tiers', 'smartTiers', async () => { await reapplyTiers(); });
+    wire('ff4_vir_contract', 'contractInjection', () => {
+        if (settings().contractInjection) injectVirContract();
+        else clearVirContract();
+    });
+    wire('ff4_vir_bind_to_chat', 'bindToChat', async () => { if (settings().bindToChat) await activateCurrentWorld(); });
+    wire('ff4_vir_cleanup_delete', 'cleanupOnChatDelete');
+    wire('ff4_vir_debug', 'debug');
+
+    $('ff4_vir_activate')?.addEventListener('click', async () => {
+        await activateCurrentWorld();
+        updateStatus();
+        renderCharacterList();
+    });
+    $('ff4_vir_refresh')?.addEventListener('click', () => { updateStatus(); renderCharacterList(); });
+    $('ff4_vir_clear_warn')?.addEventListener('click', () => {
+        settings().recentWarnings = [];
+        saveSettingsDebounced();
+        updateStatus();
+    });
+    $('ff4_vir_export')?.addEventListener('click', exportCurrentVir);
+    $('ff4_vir_import')?.addEventListener('change', function () { importVirFile(this.files?.[0]); this.value = ''; });
+    $('ff4_vir_reset')?.addEventListener('click', resetCurrentChatVir);
+
+    updateStatus();
+}
+
+async function updateStatus() {
+    const worldName = currentWorldName();
+    const setEl = (id, value) => { const el = $(id); if (el) el.textContent = value; };
+    setEl('ff4_vir_current_world', worldName || 'No active chat');
+    setEl('ff4_vir_last_sync', settings().lastSyncStatus || 'No sync yet');
+    setEl('ff4_vir_session_count', String(sessionPacketCount));
+
+    const bound = chat_metadata?.[WI_METADATA_KEY] === worldName;
+    const boundEl = $('ff4_vir_bound');
+    if (boundEl) {
+        boundEl.textContent = bound ? 'YES' : 'NO';
+        boundEl.style.color = bound ? 'var(--success, #6f6)' : 'var(--warning, #d7a900)';
+    }
+
+    let chars = 0, totalChars = 0;
+    if (worldName) {
+        try {
+            const data = await loadWorldInfo(worldName);
+            if (data) {
+                chars = characterCount(data);
+                for (const e of Object.values(getEntries(data))) {
+                    if (e && e.constant && !e.disable) totalChars += (e.content || '').length;
+                }
+            }
+        } catch { /* ignore */ }
+    }
+    setEl('ff4_vir_char_count', String(chars));
+    const tokenEl = $('ff4_vir_token_estimate');
+    if (tokenEl) {
+        const tokens = Math.round(totalChars / 3.8);
+        tokenEl.textContent = `${tokens} tok (${totalChars} chars)`;
+        tokenEl.style.color = tokens > 3000 ? 'var(--warning, #d7a900)' : 'var(--success, #6f6)';
+    }
+
+    // Warnings — limited to 5 most recent for cleaner display
+    const warnEl = $('ff4_vir_warnings');
+    const warnCountEl = $('ff4_vir_warn_count');
+    const ws = settings().recentWarnings || [];
+    if (warnCountEl) warnCountEl.textContent = String(ws.length);
+    if (warnEl) {
+        warnEl.innerHTML = ws.length
+            ? ws.slice(0, 5).map(w => `<div class="ff4-vir-warning">${escapeHtml(w)}</div>`).join('')
+            : '<div class="ff4-vir-muted">No recent warnings.</div>';
+    }
+
+    await renderCharacterList();
+}
+
+async function renderCharacterList() {
+    const container = $('ff4_vir_char_list');
+    if (!container) return;
+    const worldName = currentWorldName();
+    if (!worldName) {
+        container.innerHTML = '<div class="ff4-vir-muted">No active chat.</div>';
+        return;
+    }
+    let data; try { data = await loadWorldInfo(worldName); } catch { data = null; }
+    if (!data) {
+        container.innerHTML = '<div class="ff4-vir-muted">Could not load lorebook.</div>';
+        return;
+    }
+    const chars = characterEntries(data);
+    if (!chars.length) {
+        container.innerHTML = '<div class="ff4-vir-muted">No characters yet. AI will populate as it emits <code>```vir</code> packets.</div>';
+        return;
+    }
+    const st = settings();
+    const pinned = new Set(st.pinnedCharacters?.[worldName] || []);
+    const recall = st.recallCharacters?.[worldName] || {};
+    const rows = [];
+    for (const [, entry] of chars) {
+        const name = characterEntryName(entry);
+        if (!name) continue;
+        let tier, tierColor;
+        if (pinned.has(name)) { tier = 'PIN'; tierColor = '#FFD180'; }
+        else if (entry.constant && recall[name]) { tier = `RCL${recall[name]}`; tierColor = '#B39DDB'; }
+        else if (entry.constant) { tier = 'ACT'; tierColor = '#A5D6A7'; }
+        else { tier = 'OFF'; tierColor = '#aab4c0'; }
+        const vir = parseActiveVir(entry.content || '');
+        const color = vir?.voice_lock?.dialogue_color || '';
+        rows.push(`<div class="ff4-vir-char-row">
+            <span class="ff4-vir-char-tier" style="color:${tierColor}">[${tier}]</span>
+            <span class="ff4-vir-char-name">${escapeHtml(name)}</span>
+            ${color ? `<span style="color:${color};font-weight:600">●</span>` : ''}
+            <button class="ff4-vir-pin-btn menu_button" data-name="${escapeHtml(name)}" data-action="${pinned.has(name) ? 'park' : 'pin'}">${pinned.has(name) ? 'Unpin' : 'Pin'}</button>
+        </div>`);
+    }
+    container.innerHTML = rows.join('');
+    container.querySelectorAll('.ff4-vir-pin-btn').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const name = btn.getAttribute('data-name');
+            const action = btn.getAttribute('data-action');
+            const worldName = currentWorldName();
+            if (!worldName || !name) return;
+            const st = settings();
+            st.pinnedCharacters = st.pinnedCharacters || {};
+            st.pinnedCharacters[worldName] = st.pinnedCharacters[worldName] || [];
+            if (action === 'pin') {
+                if (!st.pinnedCharacters[worldName].includes(name)) st.pinnedCharacters[worldName].push(name);
+            } else {
+                st.pinnedCharacters[worldName] = st.pinnedCharacters[worldName].filter(n => n !== name);
+            }
+            saveSettingsDebounced();
+            await reapplyTiers();
+            updateStatus();
+        });
+    });
+}
+
+// ============================================================================
+// EXPORT / IMPORT / RESET
+// ============================================================================
+async function exportCurrentVir() {
+    const worldName = currentWorldName();
+    if (!worldName) return toastr.warning('No active VIR lorebook.', 'FF4 VIR');
+    const data = await loadWorldInfo(worldName);
+    if (!data) return toastr.warning('Failed to load lorebook.', 'FF4 VIR');
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `${worldName}.json`;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+async function importVirFile(file) {
+    if (!file) return;
+    try {
+        const text = await file.text();
+        const data = JSON.parse(text);
+        const worldName = currentWorldName();
+        if (!worldName) return toastr.warning('No active chat.', 'FF4 VIR');
+        await saveWorldInfo(worldName, data, true);
+        await updateWorldInfoList();
+        toastr.success('VIR imported.', 'FF4 VIR');
+        updateStatus();
+    } catch (e) { toastr.error(`Import failed: ${e.message}`, 'FF4 VIR'); }
+}
+async function resetCurrentChatVir() {
+    if (!confirm('Reset all VIR data for current chat? This deletes the lorebook.')) return;
+    const worldName = currentWorldName();
+    if (!worldName) return;
+    await deleteVirWorld(worldName);
+    await updateWorldInfoList();
+    toastr.info('Chat VIR reset.', 'FF4 VIR');
+    updateStatus();
+}
+
+// ============================================================================
+// BOOTSTRAP
+// ============================================================================
+jQuery(async () => {
+    settings();
+    renderSettings();
+    eventSource.on(event_types.CHAT_CHANGED, async () => {
+        await activateCurrentWorld();
+    });
+    eventSource.on(event_types.CHAT_DELETED, cleanupVirForDeletedChat);
+    eventSource.on(event_types.GROUP_CHAT_DELETED, cleanupVirForDeletedChat);
+    // Single hook only — both events fire per message; using only MESSAGE_RECEIVED
+    // prevents double-processing and the resulting duplicate parse-failure warnings.
+    eventSource.on(event_types.MESSAGE_RECEIVED, handleMessage);
+    registerSlashCommands();
+    await activateCurrentWorld();
+    log(`v${VERSION} initialized (clean rebuild)`);
+});
