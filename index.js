@@ -182,7 +182,7 @@ function nextUid(data) {
     const ids = Object.keys(entries).map(k => parseInt(k, 10)).filter(n => !isNaN(n));
     return ids.length ? Math.max(...ids) + 1 : 0;
 }
-function makeEntry({ uid, key, comment, content, constant = false, disable = false, order = 100, depth = 4, position = 4 }) {
+function makeEntry({ uid, key, comment, content, constant = false, disable = false, order = 100, depth = 4, position = 4, excludeRecursion = false, preventRecursion = false }) {
     return {
         uid, key: Array.isArray(key) ? key : [key],
         keysecondary: [], comment: String(comment || ''),
@@ -191,6 +191,7 @@ function makeEntry({ uid, key, comment, content, constant = false, disable = fal
         addMemo: true, selective: true, group: '', groupOverride: false, groupWeight: 100,
         scanDepth: null, caseSensitive: null, matchWholeWords: null, useGroupScoring: null,
         automationId: '', role: null, sticky: null, cooldown: null, delay: null,
+        excludeRecursion, preventRecursion,
     };
 }
 
@@ -508,10 +509,19 @@ function rebuildRosterEntry(data) {
     if (!entry) {
         if (!content) return null;
         const uid = nextUid(data);
-        entry = makeEntry({ uid, key: ['VIR_ROSTER'], comment: 'FF4 VIR Roster', content, constant: true, order: 43, depth: 1, position: 0 });
+        // preventRecursion: the roster is constant=true and lists every known
+        // character name. Without preventRecursion, its content would cascade-
+        // trigger every character VIR entry on every turn — destroying the
+        // tier/selective system. excludeRecursion is belt-and-braces (nothing
+        // should ever trigger an always-on entry).
+        entry = makeEntry({ uid, key: ['VIR_ROSTER'], comment: 'FF4 VIR Roster', content, constant: true, order: 43, depth: 1, position: 0, excludeRecursion: true, preventRecursion: true });
         entries[uid] = entry;
     } else if (content) {
         entry.content = content;
+        // Force-apply recursion flags on rebuild — rosters from pre-fix
+        // versions lacked them and were cascade-triggering every char entry.
+        entry.excludeRecursion = true;
+        entry.preventRecursion = true;
     } else {
         delete entries[entry.uid];
     }
