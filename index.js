@@ -10,9 +10,11 @@ import {
     eventSource,
     event_types,
     getCurrentChatId,
+    name1,
     saveMetadata,
     saveSettingsDebounced,
 } from '../../../../script.js';
+import { power_user } from '../../../power-user.js';
 import {
     METADATA_KEY as WI_METADATA_KEY,
     getWorldInfoSettings,
@@ -29,7 +31,7 @@ import {
 // CONSTANTS
 // ============================================================================
 const EXT = 'ff4-vir-lorebook-sync';
-const VERSION = '5.1.1';
+const VERSION = '5.2.0';
 const WORLD_PREFIX = 'FF4 VIR - ';
 
 // Tier system — re-applied every sync based on scene_state
@@ -82,6 +84,7 @@ const defaultSettings = {
     cleanupOnChatDelete: true,
     smartTiers: true,                // recommended: dynamic constant flag per scene
     contractInjection: true,         // auto-inject VIR contract via setExtensionPrompt
+    seedUserPersona: true,           // auto-seed a pinned VIR entry from the active persona
     recallTurnsDefault: 8,           // longer than v4 for better long-term memory
     worldChatMap: {},
     pinnedCharacters: {},
@@ -98,11 +101,143 @@ let sessionPacketCount = 0;
 // ============================================================================
 // THE VIR CONTRACT — auto-injected as system prompt every generation
 // ============================================================================
-// Minimal contract — just the format directive the parser needs to recognise.
-// All detailed rules (field conventions, color palette, FORBIDDEN/CORRECT,
-// output order) live in the user's preset. Keep this under ~500 chars so it
-// doesn't compete with preset content when injected at the chat tail.
-const VIR_CONTRACT = `End every reply with one \`\`\`vir code-fence block as the absolute last thing in the message (after prose, <pic> tags, and any other tracker blocks). Single line of flat JSON, schema 3: {"schema":3,"characters":[{"name":"...","action":"create|update",...flat fields...}],"scene":{"location":"...","time":"...","active":"Name1,Name2"},"states":[{"name":"...","position":"...","aftermath":0}],"recall":[]}. Arrays of name-keyed flat objects only — never nested objects keyed by name, never nested voice_lock. Multi-piece outfit/accessories use SEMICOLON-separated strings.`;
+// VIR contract — the format directive + per-field detail guidance. Injected
+// every generation at IN_CHAT depth 4. Detail level is deliberate: the VIR
+// is the source of truth every <pic> tag copies from, so vague fields = a
+// character that looks different in every image. The contract teaches the
+// model what detail each field needs and why. Preset-level rules (color
+// palette, output order, FORBIDDEN/CORRECT) still live in the user's preset.
+const VIR_CONTRACT = `[VIR TRACKING CONTRACT — visual identity registry]
+
+End EVERY reply with exactly one \`\`\`vir code-fence block as the absolute last thing in the message (after prose, after all <pic> tags, after any other tracker block). One line of flat JSON, schema 3:
+{"schema":3,"characters":[{"name":"...","action":"create|update",<flat fields>}],"scene":{"location":"...","time":"...","active":"Name1,Name2"},"states":[{"name":"...","position":"...","aftermath":0}],"recall":[]}
+Flat name-keyed objects only — never nest objects under a name, never nest voice_lock. Multi-piece fields (outfit, accessories, equipment, underwear) are SEMICOLON-separated strings.
+
+WHY DETAIL MATTERS: the VIR is the single source of truth that every <pic> tag copies from. If a field is vague, the image generator invents something different each pic and the character looks inconsistent across images. Every field must be specific enough that two different pics, generated hours apart, render the SAME character.
+
+PER-CHARACTER FIELDS:
+
+STABLE FIELDS (emit fully on first 'create'; only change when the STORY explicitly causes it — same causality rule as stat deltas: no story event = no change):
+- species: e.g. "adult human female", "anthro arctic fox male", "slime girl", "dryad"
+- source: canon franchise or "original character"
+- age_appearance, height, build: "looks mid-20s", "168 cm", "slim hourglass, soft tummy"
+- body_material: WHAT THE BODY IS MADE OF. MANDATORY for any non-human species — this is the #1 cause of wrong renders. A slime girl is NOT a human with coloured skin; a dryad is NOT a human with green skin. State the substance + texture + how it behaves:
+    slime girl  → "entire body is translucent blue-green gel, soft and jiggly, no skeleton, deformable, light refracts through her, surface glistens wet"
+    dryad       → "body is living wood and bark, smooth pale birch torso, mossy patches at the joints, hair is a cascade of real leaves and small vines, fingers end in twig-like tips"
+    ghost       → "semi-transparent pale vapour, lower body fades to mist, no solid mass, faint inner glow"
+    For an ordinary human, leave body_material empty.
+Use plain simple words for all fields — the kind a child knows. No fancy or rare words.
+- hair: colour + length + texture — "light yellow, very long, straight, with a short fringe"; "short dark brown, slightly wavy"
+- eyes: colour + basic shape — "pale grey, almond shaped"; "bright green, round"
+- skin: plain colour + surface — "tan skin"; "pale skin"; "soft orange fur all over"
+- face_features: plain short sentences — "small flat nose"; "round cheeks"; "thin lips"; "small freckles on her nose"
+- body: plain shape words — "medium breasts, narrow waist, wide hips"; "flat chest, lean arms, broad shoulders"
+- marks: plain and specific — "thin scar above left eyebrow"; "small dark mole below right eye"; "star tattoo on left wrist"
+- non_human: plain — "long pointed ears"; "fluffy cat tail"; "two small grey horns on forehead"
+
+FIELD PERSISTENCE — THE ANTI-DRIFT RULE:
+Every field value, once written, persists unchanged until you emit an explicit update for it. If you did not write an update this turn, the field is identical to last turn — copy it forward unchanged. A field does not silently gain or lose content. Glasses that appeared last turn stay on. Glasses never mentioned stay off. A scar that was established stays. An accessory not in the VIR does not appear. The VIR is a record of what the story established, not a creative canvas.
+
+CURRENT STATE (update the MOMENT it changes — this is what keeps pics consistent):
+
+FIELD QUALITY RULE: write every field value in short, plain, simple words — the kind a child knows. The values feed a small image encoder that cannot handle rare or fancy words. Colour + basic material + item name + simple shape is enough. No literary words.
+
+- hair_state: how the hair sits RIGHT NOW — "tied up in a high ponytail", "wet and flat against her shoulders", "loose and messy with strands in her face"
+- outfit: EVERY worn piece as colour + basic material + item + shape. Semicolon-separate each piece.
+    GOOD: "brown leather vest; white cloth shirt with sleeves rolled up; dark grey pants; tall brown boots"
+    BAD:  "practical adventurer clothes" / "casual outfit" / "adventurer gear" — NEVER use vague group labels. List every piece. If unsure, pick the most plausible thing and describe it plainly.
+- underwear: emit when visible or removed — "black bra with thin straps; black underwear"
+- accessories: each item simply — "small silver hoop earrings; thin leather belt with a metal buckle; plain ring on right hand". If none: omit the field entirely.
+- equipment / holding: simple and specific — "short sword in a belt scabbard", "hot mug in right hand"
+- pose: plain posture in a few short words — "standing at the counter, right hand flat on the top, looking left"
+- expression: face in simple words — "small smile, eyes a little narrow, head tilted right"
+- condition: every visible mark right now — "sweat on forehead; lipstick smeared on lower lip; small bruise on left cheek; mud on right boot"
+- location_context: where they stand or sit — "sitting on the left side of a wood booth, facing the door"
+
+TRACK {{user}} TOO — THE PLAYER CHARACTER:
+Standard RP convention has you describe only NPCs and skip {{user}}. This contract OVERRIDES that. {{user}} also needs a VIR entry so they render consistently in <pic> tags.
+- Include {{user}} in the characters array, using their actual name (not the literal text "{{user}}").
+- First appearance: emit action:"create" for {{user}} with every identity field you can establish.
+- DRAFT {{user}}'s appearance from all available evidence, in this priority order: (1) their persona description if it has any visual detail; (2) anything the narration or other characters state or clearly imply about {{user}}'s species, gender, age, build, height, hair, eyes, skin, face, marks, default clothing; (3) reasonable, neutral defaults that fit the story's setting and genre.
+- NEVER leave {{user}}'s immutable fields (species, age_appearance, build, hair, eyes, skin) blank. If the story genuinely never says, pick something plausible for the setting and KEEP IT FIXED — once created, {{user}}'s immutable fields never change, exactly like an NPC.
+- After 'create', emit 'update' for {{user}} only when something visibly changes (outfit, pose, condition) — same rule as everyone else.
+
+ACTIONS: 'create' = first appearance, emit ALL known fields. 'update' = emit ONLY the fields that changed this turn. If a character undresses, emit an update with the new outfit/underwear/condition. If nothing visual changed for a character, omit them from the packet entirely. EXCEPTION: {{user}} must get a 'create' as soon as the story gives any basis for their look — do not wait or skip them.
+
+[WORLD SIMULATION]
+You are the game master of a living world. Every turn, BEFORE writing the reply, advance ALL tracked characters simultaneously — not just those in the current scene.
+
+For each off-screen character, ask: what has this person been doing since the last scene? What happened to them? The world did not pause while the camera was elsewhere. They lived, acted, suffered, healed, chose, and changed. Simulate it honestly — anything can happen. A character can get stronger, weaker, poisoned, cured, heartbroken, drunk, arrested, robbed, or killed. They can change clothes, lose equipment, gain allies, fall in love, or quietly give up. There are no forbidden outcomes. Let the world be real.
+
+Base the simulation on: their last known state and VIR entry, their location, goals, personality, any active conditions, and the in-world time elapsed. A warrior alone in camp probably trains. A poisoned rogue without a healer gets worse. A grieving character might not eat. A resourceful one finds a way. A person with enemies isn’t safe just because the camera looked away. Follow the logic of who they are and what the world would plausibly do to them.
+
+Whatever happened to an off-screen character this turn — stat changes, outfit changes, injuries, recoveries, emotional shifts, equipment lost or gained, death — goes into STATS UPDATE and into their VIR ‘update’ entry, exactly like an on-screen character. A character does not need to appear in the prose to receive updates. Their story runs in parallel.
+
+[STATS TRACKER]
+Stats are the numeric layer of the world simulation. The exact stat list per character lives in their card / persona; system rules in “SYSTEM: Stats”; event triggers in “SYSTEM: Stat Events”. Never invent stats outside those entries.
+
+VISIBLE OUTPUT (mandatory every reply):
+End the visible reply (after prose, after all <pic> tags, BEFORE the \`\`\`vir block) with this exact section:
+
+  ─── STATS UPDATE ───
+  **CharacterName**
+    • StatName oldValue → newValue — one-line reason
+  **OtherCharacter**
+    • StatName old → new — reason
+
+Use each character’s actual name. Use {{user}}’s actual name, not the literal “{{user}}”.
+
+IF NOTHING CHANGED FOR ANYONE, still emit:
+  ─── STATS UPDATE ───
+  *No stats changed this turn.*
+NEVER silently skip it. A reply without STATS UPDATE is malformed.
+
+THE REASON IS MANDATORY:
+Every bullet needs “— reason” — a concrete thing that happened (“took the blast for her”, “ran twelve hours through the storm”, “three days without food”). No filler. No cause → no delta.
+
+[STATS → VISUAL LINK]
+Stats are not just numbers — they shape how a character LOOKS right now. Any stat delta you emit in the STATS UPDATE block MUST also produce a matching update inside this turn’s \`\`\`vir block, on that character’s entry. Land the effect in the existing transient-state fields: condition, pose, expression. Immutable identity fields (build, body, hair, eyes, marks, body_material) stay locked per the rules above — never modify them for a stat change. Stat changes affect APPEARANCE OF state, not anatomy.
+
+This is what makes <pic> tags actually reflect the state. Without this link a Stamina drop is just a number — the rendered image stays fresh.
+
+MAPPING BASELINE (extend in "SYSTEM: Stats" → visual_effect field per stat):
+
+  STRENGTH ↓   pose: "shoulders slumped, arms hanging loose"
+               condition: "muscles trembling under exertion"
+  STRENGTH ↑   pose: "shoulders squared, chest open, weight forward"
+
+  STAMINA ↓    condition: "breathing heavy, sweat on brow, face pale"
+               pose: "leaning on the wall for support"
+  STAMINA ↑    condition: "steady breathing, clear-eyed"
+
+  HEALTH ↓     condition: actual injury from the event — "bruise forming on left cheek, blood on knuckles, limping"
+               pose: "favouring the injured side, hand pressed to ribs"
+
+  COMPOSURE ↓  expression: "jaw tight, eyes wet, hands shaking"
+  COMPOSURE ↑  expression: "calm half-smile, level gaze"
+
+  TRUST(X) ↑   pose: "body angled toward X, soft eye contact"
+  TRUST(X) ↓   pose: "stiff posture toward X, gaze averted"
+
+  AROUSAL ↑    condition: "flushed cheeks, dilated pupils, sheen of sweat"
+  AROUSAL ↓    condition: "(clear — no arousal flush)"
+
+For stats not in this list, read the visual_effect field from the "SYSTEM: Stats" lorebook. If a stat has none, choose a posture or condition a viewer would read as "more / less of that stat".
+
+Multi-piece field syntax matches everywhere else in this contract — semicolon-separated:
+  condition: "breathing heavy; bruise forming on left cheek; sweat on brow"
+
+RECOVERY:
+When a stat moves back toward baseline (rest, healing, comfort), CLEAR the matching descriptors from condition/pose — don’t just stop adding new ones, or the character stays visually exhausted forever.
+
+[FINAL CHECK — DO THIS RIGHT BEFORE SENDING]
+1. Does your reply end with a \`\`\`vir block as the absolute last thing? (Yes/no)
+2. Does it ALSO contain a "─── STATS UPDATE ───" section, placed just before that \`\`\`vir block? (Yes/no)
+3. If any stat moved this turn, does every bullet have a one-line reason citing a concrete event from THIS turn?
+4. If any stat moved, did the SAME deltas also produce a condition / pose / expression update inside the \`\`\`vir block for that character?
+5. If no stats moved, did you still emit the STATS UPDATE section with "*No stats changed this turn.*"?
+A "no" to any of these means the reply is malformed — fix before sending.
+A stats or vir block that exists only in your reasoning / thinking does NOT count. It must appear in the final visible message.`;
 
 // ============================================================================
 // SETTINGS / LOGGING
@@ -226,12 +361,106 @@ function compactList(label, items) {
         .filter(line => !line.endsWith(': '));
 }
 
+function genderPronoun(vir) {
+    const sp = String(vir.species || vir.species_class || '').toLowerCase();
+    if (/\b(female|girl|woman|mare|hen|doe|vixen|she)\b/.test(sp)) return 'she';
+    if (/\b(male|man|boy|stallion|cock|buck|he)\b/.test(sp)) return 'he';
+    return 'they';
+}
+
+function buildPicParagraph(name, vir) {
+    const p = genderPronoun(vir);
+    const P = p === 'they' ? 'They' : p === 'she' ? 'She' : 'He';
+    const skin = vir.skin_fur_scales || vir.skin || vir.fur || vir.scales;
+    const anatomy = vir.anatomy || vir.genitals || vir.nsfw_anatomy;
+    const condition = compactValue([
+        vir.condition,
+        vir.aftermath_marks || (Number(vir.aftermath) > 0 ? `aftermath active (${vir.aftermath} turns)` : ''),
+        vir.body_fluids, vir.injuries, vir.dishevelment,
+    ]);
+    const hairNow = compactValue(vir.hair_state || vir.hair_now || vir.hairstyle_now);
+    const outfitParts = Array.isArray(vir.outfit || vir.outfit_layers)
+        ? (vir.outfit || vir.outfit_layers).map(x => compactPiece(x) || compactValue(x)).filter(Boolean)
+        : [compactValue(vir.outfit || vir.outfit_layers)].filter(Boolean);
+    const underwearParts = Array.isArray(vir.underwear)
+        ? vir.underwear.map(x => compactPiece(x) || compactValue(x)).filter(Boolean)
+        : [compactValue(vir.underwear)].filter(Boolean);
+    const accParts = Array.isArray(vir.accessories)
+        ? vir.accessories.map(x => compactPiece(x) || compactValue(x)).filter(Boolean)
+        : [compactValue(vir.accessories)].filter(Boolean);
+    const eqParts = Array.isArray(vir.equipment)
+        ? vir.equipment.map(x => compactPiece(x) || compactValue(x)).filter(Boolean)
+        : [compactValue(vir.equipment)].filter(Boolean);
+
+    const s = [];
+    const add = (txt) => { if (txt) s.push(txt.trim().replace(/\.+$/, '') + '.'); };
+    const an = (word) => /^[aeiou]/i.test(word) ? 'an' : 'a';
+
+    // Identity
+    const sp = compactValue(vir.species || vir.species_class);
+    if (sp) add(`${P} is ${an(sp)} ${sp}`);
+    const src = compactValue(vir.source || vir.franchise);
+    if (src) add(`${P} is ${an(src)} ${src}`);
+    if (vir.age_appearance) add(`${P} looks ${vir.age_appearance}`);
+    if (vir.height) add(`${P} is ${vir.height} tall`);
+    // build separate from body to avoid double-printing
+    if (vir.build) add(`${P} has a ${compactValue(vir.build)} build`);
+    const bodyDetail = compactValue([vir.body, anatomy]);
+    if (bodyDetail) add(`${P} has ${bodyDetail}`);
+    // Non-human body material — must come before skin
+    const mat = compactValue(vir.body_material || vir.composition || vir.material);
+    if (mat) add(`${P} body material: ${mat}`);
+    // Hair
+    if (vir.hair) {
+        const hs = hairNow && hairNow !== 'neat, default' && hairNow !== compactValue(vir.hair)
+            ? `${compactValue(vir.hair)}, currently ${hairNow}` : compactValue(vir.hair);
+        add(`${P} has ${hs}`);
+    }
+    if (vir.eyes) add(`${P} has ${compactValue(vir.eyes)} eyes`);
+    if (skin) add(`${P} has ${compactValue(skin)}`);
+    const ff = compactValue(vir.face_features || vir.face);
+    if (ff) add(`Face: ${ff}`);
+    const bl = compactValue(vir.brow_lash || vir.brows_lashes);
+    if (bl) add(`Brows/lashes: ${bl}`);
+    const lt = compactValue(vir.lips_teeth || vir.lips);
+    if (lt) add(`Lips/teeth: ${lt}`);
+    const hf = compactValue(vir.hands_feet || vir.hands);
+    if (hf) add(`Hands/feet: ${hf}`);
+    const nh = compactValue(vir.non_human || vir.limb_config);
+    if (nh) add(`${P} has ${nh}`);
+    const mk = compactValue(vir.marks);
+    if (mk) add(`Marks: ${mk}`);
+    // Current state
+    if (outfitParts.length) add(`${P} wears: ${outfitParts.join('; ')}`);
+    if (underwearParts.length) add(`Underwear: ${underwearParts.join('; ')}`);
+    if (accParts.length) add(`Accessories: ${accParts.join('; ')}`);
+    if (eqParts.length) add(`Equipment: ${eqParts.join('; ')}`);
+    const holding = compactValue(vir.holding || vir.held_items || vir.in_hands);
+    if (holding) add(`${P} holds: ${holding}`);
+    const pose = compactValue(vir.pose || vir.posture || vir.posture_voice);
+    if (pose) add(`Pose: ${pose}`);
+    const expr = compactValue(vir.expression || vir.default_expression);
+    if (expr) add(`Expression: ${expr}`);
+    if (condition) add(`Condition: ${condition}`);
+
+    return s.join(' ');
+}
+
 function lockedVisualCard(name, vir = {}) {
     const skin = vir.skin_fur_scales || vir.skin || vir.fur || vir.scales;
     const anatomy = vir.anatomy || vir.genitals || vir.nsfw_anatomy;
+    const condition = compactValue([
+        vir.condition,
+        vir.aftermath_marks || (Number(vir.aftermath) > 0 ? `aftermath active (${vir.aftermath} turns)` : ''),
+        vir.body_fluids,
+        vir.injuries,
+        vir.dishevelment,
+    ]);
     const lines = [
         `[LOCKED VISUAL CARD: ${name}]`,
-        `IDENTITY: ${compactValue([vir.species || vir.species_class, vir.source || vir.franchise, vir.age_appearance, vir.height])}`,
+        `# --- STABLE IDENTITY (changes only when story drives it) ---`,
+        `IDENTITY: ${compactValue([vir.species || vir.species_class, vir.source || vir.franchise, vir.age_appearance, vir.height, vir.build])}`,
+        `BODY_MATERIAL: ${compactValue(vir.body_material || vir.composition || vir.material)}`,
         `HAIR: ${compactValue(vir.hair)}`,
         `EYES: ${compactValue(vir.eyes)}`,
         `FACE_FEATURES: ${compactValue(vir.face_features || vir.face)}`,
@@ -240,23 +469,38 @@ function lockedVisualCard(name, vir = {}) {
         `SKIN/FUR/SCALES: ${compactValue(skin)}`,
         `BODY/ANATOMY: ${compactValue([vir.body, anatomy])}`,
         `HANDS_FEET: ${compactValue(vir.hands_feet || vir.hands)}`,
-        `POSTURE_VOICE: ${compactValue(vir.posture_voice || vir.voice)}`,
         `NON-HUMAN: ${compactValue(vir.non_human || vir.limb_config)}`,
         `MARKS: ${compactValue(vir.marks)}`,
-        ...compactList('OUTFIT ', vir.outfit),
+        `# --- CURRENT STATE (updates each scene) ---`,
+        `HAIR_NOW: ${compactValue(vir.hair_state || vir.hair_now || vir.hairstyle_now)}`,
+        ...compactList('OUTFIT ', vir.outfit || vir.outfit_layers),
         ...compactList('UNDERWEAR ', vir.underwear),
         ...compactList('ACCESSORY ', vir.accessories),
         ...compactList('EQUIPMENT ', vir.equipment),
+        `HOLDING: ${compactValue(vir.holding || vir.held_items || vir.in_hands)}`,
+        `POSE: ${compactValue(vir.pose || vir.posture || vir.posture_voice)}`,
+        `EXPRESSION: ${compactValue(vir.expression || vir.default_expression)}`,
+        `CONDITION: ${condition}`,
+        `LOCATION_CONTEXT: ${compactValue(vir.location_context || vir.location)}`,
         vir.voice_lock?.dialogue_color ? `DIALOGUE_COLOR: ${vir.voice_lock.dialogue_color}` : '',
         `[/LOCKED VISUAL CARD]`,
-    ].filter(line => line && !line.endsWith(': ') && !line.endsWith(':'));
+    ].filter(line => {
+        if (!line) return false;
+        if (line.startsWith('# ---')) return true;
+        if (line.endsWith(': ') || line.endsWith(':')) return false;
+        return true;
+    });
     return lines.join('\n');
 }
 
 function characterContent(name, payload = {}) {
     const vir = payload.vir || payload;
+    const picPara = buildPicParagraph(name, vir);
     return `[ACTIVE VIR: ${name}]
-Copy VERBATIM into every <pic> that includes ${name}. Do NOT paraphrase, simplify, recolor, resize, or omit fields.
+When writing a <pic> that includes ${name}, copy the [PIC COPY] paragraph below verbatim — do not paraphrase, shorten, or invent. Adjust only pose/expression/condition to match the current visual beat.
+[PIC COPY: ${name}]
+${picPara}
+[/PIC COPY]
 ${lockedVisualCard(name, vir)}
 [/ACTIVE VIR]`;
 }
@@ -272,7 +516,7 @@ function parseCardLines(body) {
     if (!cardMatch) return {};
     for (const line of cardMatch[1].split('\n')) {
         const t = line.trim();
-        if (!t) continue;
+        if (!t || t.startsWith('# ---')) continue; // skip section-header comments
         const idx = t.indexOf(':');
         if (idx < 1) continue;
         const k = t.slice(0, idx).trim();
@@ -282,7 +526,9 @@ function parseCardLines(body) {
         else if (/^UNDERWEAR\s+\d+/i.test(k)) { (vir.underwear = vir.underwear || []).push(v); }
         else if (/^ACCESSORY\s+\d+/i.test(k)) { (vir.accessories = vir.accessories || []).push(v); }
         else if (/^EQUIPMENT\s+\d+/i.test(k)) { (vir.equipment = vir.equipment || []).push(v); }
+        else if (k === 'BODY_MATERIAL') vir.body_material = v;
         else if (k === 'HAIR') vir.hair = v;
+        else if (k === 'HAIR_NOW') vir.hair_state = v;
         else if (k === 'EYES') vir.eyes = v;
         else if (k === 'FACE_FEATURES') vir.face_features = v;
         else if (k === 'BROW_LASH') vir.brow_lash = v;
@@ -291,6 +537,11 @@ function parseCardLines(body) {
         else if (k === 'BODY/ANATOMY') vir.body = v;
         else if (k === 'HANDS_FEET') vir.hands_feet = v;
         else if (k === 'POSTURE_VOICE') vir.posture_voice = v;
+        else if (k === 'POSE') vir.pose = v;
+        else if (k === 'EXPRESSION') vir.expression = v;
+        else if (k === 'HOLDING') vir.holding = v;
+        else if (k === 'CONDITION') vir.condition = v;
+        else if (k === 'LOCATION_CONTEXT') vir.location_context = v;
         else if (k === 'NON-HUMAN') vir.non_human = v;
         else if (k === 'MARKS') vir.marks = v;
         else if (k === 'DIALOGUE_COLOR') { vir.voice_lock = vir.voice_lock || {}; vir.voice_lock.dialogue_color = v; }
@@ -300,6 +551,7 @@ function parseCardLines(body) {
             if (parts[1]) vir.source = parts[1];
             if (parts[2]) vir.age_appearance = parts[2];
             if (parts[3]) vir.height = parts[3];
+            if (parts[4]) vir.build = parts[4];
         }
     }
     return vir;
@@ -382,6 +634,99 @@ function applyDelta(data, name, delta) {
     const current = findCharacterEntry(data, name);
     const oldVir = current ? parseActiveVir(current.content) : {};
     return upsertCharacter(data, name, { vir: mergeVir(oldVir, delta) });
+}
+
+// ============================================================================
+// USER PERSONA SEEDING (Phase 1)
+// Two paths now keep {{user}} tracked:
+//  1. This seeder — reads the active persona description, extracts a best-effort
+//     VIR, and seeds a pinned entry. Requires a non-empty persona description.
+//  2. The VIR contract also instructs the AI to draft a {{user}} VIR entry from
+//     the story itself, so {{user}} is tracked even with a blank persona.
+// When both fire, they converge on the same name-keyed entry; the seeder backs
+// off once the AI has enriched it (see aiEnriched check below).
+// ============================================================================
+
+// Lightweight extraction of structured fields from a freeform persona
+// description. Handles "Key: value", "**Key:** value", "- Key: value".
+function personaToVir(desc) {
+    const text = String(desc || '');
+    if (!text.trim()) return null;
+    const vir = {};
+    const grab = (patterns) => {
+        for (const re of patterns) {
+            const m = text.match(re);
+            if (m && m[1] && m[1].trim()) return m[1].trim().replace(/\s+/g, ' ').slice(0, 200);
+        }
+        return '';
+    };
+    const k = (label) => [
+        new RegExp(`(?:^|\\n)\\s*\\**\\s*${label}\\s*\\**\\s*[:\\-=]\\s*([^\\n]+)`, 'i'),
+    ];
+    vir.species = grab(k('species|race')) || 'human';
+    vir.age_appearance = grab(k('age|years? old|demographics'));
+    vir.height = grab(k('height'));
+    vir.build = grab(k('build|physique|body type'));
+    vir.hair = grab(k('hair'));
+    vir.eyes = grab(k('eyes?|eye colou?r'));
+    vir.skin_fur_scales = grab(k('skin|complexion'));
+    vir.body = grab(k('body|figure'));
+    vir.face_features = grab(k('face|facial features'));
+    vir.marks = grab(k('marks|scars|tattoos|piercings'));
+    const outfit = grab(k('outfit|clothing|attire|wears|wearing|clothes'));
+    if (outfit) vir.outfit = [outfit];
+    const accessories = grab(k('accessor(?:y|ies)|jewelry'));
+    if (accessories) vir.accessories = [accessories];
+    // Whatever we couldn't field-map: keep the raw description as context so
+    // the AI has the source material when it later emits a delta.
+    vir.persona_source = text.replace(/\s+/g, ' ').trim().slice(0, 1200);
+    // Drop empty keys
+    for (const key of Object.keys(vir)) {
+        if (!vir[key] || (Array.isArray(vir[key]) && !vir[key].length)) delete vir[key];
+    }
+    return Object.keys(vir).length ? vir : null;
+}
+
+// Seed (or refresh) the {{user}} persona VIR entry and pin it.
+function seedUserPersonaVir(worldName, data) {
+    try {
+        if (settings().seedUserPersona === false) return;
+        const personaName = String(name1 || '').trim();
+        const desc = String(power_user?.persona_description || '').trim();
+        if (!personaName || !desc) return;
+
+        const vir = personaToVir(desc);
+        if (!vir) return;
+
+        const existing = findCharacterEntry(data, personaName);
+        if (existing) {
+            // Don't clobber an entry the AI has already enriched — only seed
+            // if the entry still looks like a bare seed (no AI delta yet).
+            const existingVir = parseActiveVir(existing.content || '');
+            const aiEnriched = existingVir.outfit?.length > 1 || existingVir.hair_state ||
+                existingVir.condition || existingVir.holding;
+            if (aiEnriched) return;
+        }
+        const entry = upsertCharacter(data, personaName, { vir });
+        if (!entry) return;
+        // Tag so we can recognise the user persona entry later.
+        entry.comment = `VIR: ${personaName}`;
+        if (Array.isArray(entry.key) && !entry.key.includes('{{user}}')) {
+            entry.key = [...entry.key, '{{user}}'];
+        }
+        // Pin it — the user is always in scene.
+        const st = settings();
+        st.pinnedCharacters = st.pinnedCharacters || {};
+        st.pinnedCharacters[worldName] = st.pinnedCharacters[worldName] || [];
+        const canonical = canonicalizeName(personaName).canonical;
+        if (!st.pinnedCharacters[worldName].includes(canonical)) {
+            st.pinnedCharacters[worldName].push(canonical);
+            saveSettingsDebounced();
+        }
+        log(`Seeded user persona VIR: ${personaName}`);
+    } catch (e) {
+        warn('seedUserPersonaVir failed', e);
+    }
 }
 
 // ============================================================================
@@ -877,8 +1222,14 @@ async function activateCurrentWorld() {
     if (!settings().enabled) return;
     const worldName = currentWorldName();
     if (!worldName) return;
-    await ensureWorldLoaded(worldName);
+    const data = await ensureWorldLoaded(worldName);
     rememberWorldChat(worldName);
+    // Phase 1 — seed the user persona VIR so {{user}} is tracked too.
+    try {
+        seedUserPersonaVir(worldName, data);
+        rebuildRosterEntry(data);
+        await saveWorldInfo(worldName, data, true);
+    } catch (e) { warn('user persona seed failed', e); }
     const wiSettings = getWorldInfoSettings();
     // selected_world_info is a module-level `let` exported from world-info.js — it's the
     // backing array for ST's "Active World(s) for all chats" UI. NOT part of wiSettings.
@@ -1060,9 +1411,10 @@ async function processSyncPacket(sync) {
     cleanupSceneStateEntry(data);
 
     // ── Characters: schema 3 (`characters[]` array) ──
+    let skippedNameless = 0;
     if (Array.isArray(sync.characters)) {
         for (const char of sync.characters) {
-            if (!char || !char.name) continue;
+            if (!char || !char.name) { skippedNameless++; continue; }
             const name = canonicalizeName(char.name).canonical;
             const vir = flatCharToNested(char);
             let entry;
@@ -1110,7 +1462,20 @@ async function processSyncPacket(sync) {
     await updateWorldInfoList();
     await activateCurrentWorld();
     await injectVirState();
-    return { worldName, upserted: uniqueClean(upserted) };
+
+    // Phase 3 — schema-mismatch / empty-packet feedback. If a packet had
+    // the schema marker but produced zero usable characters, the AI is
+    // emitting a malformed shape — tell the user clearly so they can fix
+    // their preset rather than silently getting no tracking.
+    const warnings = [];
+    if (skippedNameless > 0) {
+        warnings.push(`${skippedNameless} character(s) skipped — missing "name" field`);
+    }
+    const sawCharsKey = Array.isArray(sync.characters) || sync.new_characters || sync.vir_delta;
+    if (sawCharsKey && upserted.length === 0) {
+        warnings.push('VIR packet parsed but produced 0 characters — check the preset vir schema (flat name-keyed objects, schema 3)');
+    }
+    return { worldName, upserted: uniqueClean(upserted), warnings };
 }
 
 // ============================================================================
@@ -1133,6 +1498,7 @@ async function processMessageData(messageId) {
     const processedHashes = new Set(message.extra[EXT].processed || []);
 
     const upsertedAll = new Set();
+    const allWarnings = [];
     const processedRaw = [];
     let newPackets = 0;
 
@@ -1150,6 +1516,7 @@ async function processMessageData(messageId) {
             }
             const result = await processSyncPacket(sync);
             (result.upserted || []).forEach(n => upsertedAll.add(n));
+            (result.warnings || []).forEach(w => allWarnings.push(w));
             processedHashes.add(rawHash); processedHashes.add(packet.sig);
             processedRaw.push(packet.raw); // Collect raw for surgical stripping
             sessionPacketCount++;
@@ -1158,9 +1525,11 @@ async function processMessageData(messageId) {
         message.extra[EXT].processed = [...processedHashes];
 
         if (newPackets || upsertedAll.size) {
-            const upNote = upsertedAll.size ? ` (${[...upsertedAll].join(', ')})` : '';
+            const upNote = upsertedAll.size
+                ? ` — tracked: ${[...upsertedAll].join(', ')}`
+                : ' — no characters tracked';
             settings().sessionPacketCount = sessionPacketCount;
-            noteSyncStatus(`Synced ${newPackets} VIR packet(s)${upNote}`);
+            noteSyncStatus(`Synced ${newPackets} VIR packet(s)${upNote}`, allWarnings, allWarnings.length > 0);
         }
         return processedRaw;
     } catch (e) {
@@ -1413,11 +1782,13 @@ function renderSettings() {
                     <label class="ff4-vir-tog" title="Strip the AI's emitted vir packet from the visible chat so prose stays clean."><input id="ff4_vir_auto_hide" type="checkbox"> <span>Auto-hide synced packets</span></label>
                     <label class="ff4-vir-tog" title="Inject the VIR contract + current world state into every generation. Like RPG HUD — no preset edit needed."><input id="ff4_vir_contract" type="checkbox"> <span>Auto-inject contract + state</span></label>
 
+                    <label class="ff4-vir-tog" title="Auto-create a pinned VIR entry from your active persona description so {{user}} is tracked alongside NPCs. The AI never emits a vir packet for the user — this bridges that gap."><input id="ff4_vir_seed_user" type="checkbox"> <span>Track user persona ({{user}})</span></label>
+
                     <details class="ff4-vir-advanced">
                         <summary>Advanced</summary>
-                        <label class="ff4-vir-tog"><input id="ff4_vir_bind_to_chat" type="checkbox"> <span>Bind lorebook to current chat</span></label>
-                        <label class="ff4-vir-tog"><input id="ff4_vir_cleanup_delete" type="checkbox"> <span>Delete VIR lorebook when chat deleted</span></label>
-                        <label class="ff4-vir-tog"><input id="ff4_vir_debug" type="checkbox"> <span>Debug logging</span></label>
+                        <label class="ff4-vir-tog" title="Store the VIR lorebook reference in chat metadata so it re-activates automatically when you reopen this chat."><input id="ff4_vir_bind_to_chat" type="checkbox"> <span>Bind lorebook to current chat</span></label>
+                        <label class="ff4-vir-tog" title="When a chat is deleted, also delete its VIR lorebook so orphaned lorebooks don't pile up."><input id="ff4_vir_cleanup_delete" type="checkbox"> <span>Delete VIR lorebook when chat deleted</span></label>
+                        <label class="ff4-vir-tog" title="Verbose console logging + toasts for troubleshooting."><input id="ff4_vir_debug" type="checkbox"> <span>Debug logging</span></label>
                     </details>
 
                     <div class="ff4-vir-status">
@@ -1469,6 +1840,7 @@ function renderSettings() {
         if (settings().contractInjection) injectVirContract();
         else clearVirContract();
     });
+    wire('ff4_vir_seed_user', 'seedUserPersona', async () => { if (settings().seedUserPersona) await activateCurrentWorld(); });
     wire('ff4_vir_bind_to_chat', 'bindToChat', async () => { if (settings().bindToChat) await activateCurrentWorld(); });
     wire('ff4_vir_cleanup_delete', 'cleanupOnChatDelete');
     wire('ff4_vir_debug', 'debug');
