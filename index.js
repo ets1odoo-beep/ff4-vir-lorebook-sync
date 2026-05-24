@@ -1378,19 +1378,24 @@ const POSITION_IN_CHAT = 2;
 function buildPriorityReminder() {
     const st = settings();
     const misses = Math.max(0, st.consecutiveMisses || 0);
+    // Always-present anti-deliberation header — bypasses provider's agentic
+    // "draft, verify, redraft" training that bloats thinking models like
+    // Kimi K2.6. Reasoning stays for STORY content but skips meta-rule-checks.
+    const ANTI_AGENT = `[REASONING MODE: single-pass RP, not agent verify-loop. Apply rules silently \xe2\x80\x94 no rule-citation in reasoning, no draft-then-revise.]`;
     if (misses === 0) {
-        // Tiny anchor — 15 tokens. Keeps the rule in fresh attention without bloat.
-        return `[VIR REMINDER] End this reply with one \`\`\`vir code-fence as the absolute last line. Even an empty delta needs the fence.`;
+        return `${ANTI_AGENT}
+[VIR REMINDER] End this reply with one \`\`\`vir code-fence as the absolute last line. Even an empty delta needs the fence.`;
     }
     if (misses === 1) {
-        return `[VIR PRIORITY \xe2\x80\x94 your previous reply did NOT contain a \`\`\`vir block. That is malformed.
+        return `${ANTI_AGENT}
+[VIR PRIORITY \xe2\x80\x94 your previous reply did NOT contain a \`\`\`vir block. That is malformed.
 Every reply MUST end with one \`\`\`vir code-fence as the absolute last thing in the visible reply (not inside reasoning, not inside <details>).
 Schema: {"schema":3,"characters":[{"name":"...","action":"create|update",<fields>}],"scene":{...}}
 If nothing changed for any character, still emit: {"schema":3,"characters":[],"scene":{...}}
 [END VIR PRIORITY]`;
     }
-    // 2+ consecutive misses — strongest escalation
-    return `[VIR PRIORITY \xe2\x80\x94 CRITICAL: your last ${misses} replies have skipped the \`\`\`vir block. The HUD has no record of recent state changes \xe2\x80\x94 characters are visually drifting because of this.
+    return `${ANTI_AGENT}
+[VIR PRIORITY \xe2\x80\x94 CRITICAL: your last ${misses} replies have skipped the \`\`\`vir block. The HUD has no record of recent state changes \xe2\x80\x94 characters are visually drifting because of this.
 FIX NOW: this reply MUST end with one \`\`\`vir code-fence as the absolute LAST thing in the visible message. NOT in your reasoning. NOT inside <think>. NOT inside <details>. As literal markdown at the bottom of your prose.
 Required schema: {"schema":3,"characters":[{"name":"<who is in scene or whose state changed>","action":"create|update",<at minimum: outfit, pose, expression, condition>}],"scene":{"location":"...","time":"...","active":"<comma-separated names in scene>"}}
 A reply that ends with anything other than \`\`\`vir is MALFORMED and will be rejected. End with the fence.
