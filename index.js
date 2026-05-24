@@ -93,6 +93,9 @@ const defaultSettings = {
     lastSyncAt: 0,
     sessionPacketCount: 0,
     recentWarnings: [],
+    // ── v5.4 miss tracking (escalating depth-1 reminder) ──
+    consecutiveMisses: 0,            // streak of recent turns with no vir block
+    totalMisses: 0,                  // lifetime counter across all chats (debug aid)
 };
 const MAX_RECENT_WARNINGS = 10;
 let processingQueue = Promise.resolve();
@@ -158,7 +161,7 @@ TRACK {{user}} TOO — THE PLAYER CHARACTER:
 Standard RP convention has you describe only NPCs and skip {{user}}. This contract OVERRIDES that. {{user}} also needs a VIR entry so they render consistently in <pic> tags.
 - Include {{user}} in the characters array, using their actual name (not the literal text "{{user}}").
 - First appearance: emit action:"create" for {{user}} with every identity field you can establish.
-- DRAFT {{user}}'s appearance from all available evidence, in this priority order: (1) their persona description if it has any visual detail; (2) anything the narration or other characters state or clearly imply about {{user}}'s species, gender, age, build, height, hair, eyes, skin, face, marks, default clothing; (3) reasonable, neutral defaults that fit the story's setting and genre.
+- DRAFT {{user}}'s appearance from CURRENT CONTEXT ONLY. Priority: (1) active persona description if it has visual detail; (2) current card, scenario, first message, and visible story/chat evidence; (3) reasonable neutral defaults that fit the current setting and genre. Do NOT use other saved personas, unrelated chats, memory from other sessions, or old profiles.
 - NEVER leave {{user}}'s immutable fields (species, age_appearance, build, hair, eyes, skin) blank. If the story genuinely never says, pick something plausible for the setting and KEEP IT FIXED — once created, {{user}}'s immutable fields never change, exactly like an NPC.
 - After 'create', emit 'update' for {{user}} only when something visibly changes (outfit, pose, condition) — same rule as everyone else.
 
@@ -361,6 +364,10 @@ function compactList(label, items) {
         .filter(line => !line.endsWith(': '));
 }
 
+function splitPackedFacts(value) {
+    return String(value || '').split(/[;,]/).map(s => s.trim()).filter(Boolean);
+}
+
 function genderPronoun(vir) {
     const sp = String(vir.species || vir.species_class || '').toLowerCase();
     if (/\b(female|girl|woman|mare|hen|doe|vixen|she)\b/.test(sp)) return 'she';
@@ -398,10 +405,18 @@ function buildPicParagraph(name, vir) {
 
     // Identity
     const sp = compactValue(vir.species || vir.species_class);
-    if (sp) add(`${P} is ${an(sp)} ${sp}`);
+    if (sp) {
+        const bits = splitPackedFacts(sp);
+        if (bits.length > 1) {
+            add(`${P} is ${an(bits[0])} ${bits[0]}`);
+            for (const bit of bits.slice(1)) add(`${P} is ${bit}`);
+        } else {
+            add(`${P} is ${an(sp)} ${sp}`);
+        }
+    }
     const src = compactValue(vir.source || vir.franchise);
     if (src) add(`${P} is ${an(src)} ${src}`);
-    if (vir.age_appearance) add(`${P} looks ${vir.age_appearance}`);
+    if (vir.age_appearance) add(String(vir.age_appearance).trim().toLowerCase().startsWith('looks ') ? `${P} ${vir.age_appearance}` : `${P} looks ${vir.age_appearance}`);
     if (vir.height) add(`${P} is ${vir.height} tall`);
     // build separate from body to avoid double-printing
     if (vir.build) add(`${P} has a ${compactValue(vir.build)} build`);
@@ -510,6 +525,12 @@ function parseActiveVir(content) {
     if (!m) return {};
     return parseCardLines(m[1]);
 }
+
+function extractPicCopy(content) {
+    const m = String(content || '').match(/\[PIC COPY:[^\]]+\]\s*([\s\S]*?)\s*\[\/PIC COPY\]/i);
+    return m ? m[1].replace(/\s+/g, ' ').trim() : '';
+}
+
 function parseCardLines(body) {
     const vir = {};
     const cardMatch = body.match(/\[LOCKED VISUAL CARD:[^\]]+\]([\s\S]*?)\[\/LOCKED VISUAL CARD\]/);
@@ -546,12 +567,16 @@ function parseCardLines(body) {
         else if (k === 'MARKS') vir.marks = v;
         else if (k === 'DIALOGUE_COLOR') { vir.voice_lock = vir.voice_lock || {}; vir.voice_lock.dialogue_color = v; }
         else if (k === 'IDENTITY') {
-            const parts = v.split(',').map(s => s.trim()).filter(Boolean);
+            const parts = splitPackedFacts(v);
             if (parts[0]) vir.species = parts[0];
-            if (parts[1]) vir.source = parts[1];
-            if (parts[2]) vir.age_appearance = parts[2];
-            if (parts[3]) vir.height = parts[3];
-            if (parts[4]) vir.build = parts[4];
+            const buildBits = [];
+            for (const part of parts.slice(1)) {
+                if (!vir.source && /\b(original|canon|franchise|from)\b/i.test(part)) vir.source = part;
+                else if (!vir.height && /(\d+\s*cm|\bcm\b|\bfeet\b|\bft\b|tall)/i.test(part)) vir.height = part;
+                else if (!vir.age_appearance && /\b(looks|mid|late|early|teen|20s|30s|40s|50s|adult|young|old)\b/i.test(part)) vir.age_appearance = part;
+                else buildBits.push(part);
+            }
+            if (buildBits.length) vir.build = buildBits.join('; ');
         }
     }
     return vir;
@@ -663,7 +688,16 @@ function personaToVir(desc) {
     const k = (label) => [
         new RegExp(`(?:^|\\n)\\s*\\**\\s*${label}\\s*\\**\\s*[:\\-=]\\s*([^\\n]+)`, 'i'),
     ];
-    vir.species = grab(k('species|race')) || 'human';
+    const look = grab(k('look|appearance|visual|looks'));
+    const nationality = grab(k('nationality|ethnicity'));
+    const personaName = grab(k('name'));
+
+    vir.species = grab(k('species|race'));
+    if (!vir.species) {
+        if (/\b(man|male|guy|boy|he|him)\b/i.test(text)) vir.species = 'adult human male';
+        else if (/\b(woman|female|girl|she|her)\b/i.test(text)) vir.species = 'adult human female';
+        else vir.species = 'human';
+    }
     vir.age_appearance = grab(k('age|years? old|demographics'));
     vir.height = grab(k('height'));
     vir.build = grab(k('build|physique|body type'));
@@ -677,6 +711,38 @@ function personaToVir(desc) {
     if (outfit) vir.outfit = [outfit];
     const accessories = grab(k('accessor(?:y|ies)|jewelry'));
     if (accessories) vir.accessories = [accessories];
+
+    const visualText = [look, text].filter(Boolean).join('\n');
+    if (!vir.age_appearance) {
+        const m = visualText.match(/\b(?:age\s*)?(\d{2})\b/);
+        if (m) vir.age_appearance = `${m[1]} years old`;
+    }
+    if (!vir.height && /\btall\b/i.test(visualText)) vir.height = 'tall';
+    if (!vir.build) {
+        const bits = [];
+        for (const word of ['muscular', 'fit', 'lean', 'slim', 'average build', 'broad shoulders', 'defined physique', 'fat', 'big']) {
+            if (new RegExp(`\\b${word.replace(/\s+/g, '\\s+')}\\b`, 'i').test(visualText)) bits.push(word);
+        }
+        if (bits.length) vir.build = uniqueClean(bits).join('; ');
+    }
+    if (!vir.hair) {
+        const m = visualText.match(/\b((?:jet-black|black|dark brown|brown|blond|blonde|red|white|silver|gray|grey)[^.;,\n]{0,45}\bhair)\b/i);
+        if (m) vir.hair = m[1];
+    }
+    if (!vir.eyes) {
+        const m = visualText.match(/\b((?:sharp\s+)?(?:dark|black|brown|blue|green|gray|grey|gold|amber)[^.;,\n]{0,35}\beyes)\b/i);
+        if (m) vir.eyes = m[1].replace(/\beyes$/i, '').trim();
+    }
+    if (!vir.skin_fur_scales) {
+        const m = visualText.match(/\b(golden-brown skin|brown skin|dark skin|light skin|pale skin|tan skin|fair skin|olive skin)\b/i);
+        if (m) vir.skin_fur_scales = m[1];
+    }
+    if (!vir.body && look) vir.body = look;
+    if (nationality && !String(vir.body || '').toLowerCase().includes(nationality.toLowerCase())) {
+        vir.body = compactValue([nationality, vir.body]);
+    }
+    if (personaName) vir.aliases = [personaName];
+
     // Whatever we couldn't field-map: keep the raw description as context so
     // the AI has the source material when it later emits a delta.
     vir.persona_source = text.replace(/\s+/g, ' ').trim().slice(0, 1200);
@@ -685,6 +751,25 @@ function personaToVir(desc) {
         if (!vir[key] || (Array.isArray(vir[key]) && !vir[key].length)) delete vir[key];
     }
     return Object.keys(vir).length ? vir : null;
+}
+
+function virVisualCompleteness(vir = {}) {
+    let score = 0;
+    for (const key of ['species', 'age_appearance', 'height', 'build', 'hair', 'eyes', 'skin_fur_scales', 'body', 'face_features', 'marks']) {
+        if (vir[key]) score++;
+    }
+    if (Array.isArray(vir.outfit) && vir.outfit.length) score += Math.min(2, vir.outfit.length);
+    if (Array.isArray(vir.accessories) && vir.accessories.length) score++;
+    return score;
+}
+
+function isWeakUserVir(vir = {}) {
+    if (virVisualCompleteness(vir) < 8) return true;
+    const weakBody = /^(adult )?human( male| female)?$/i.test(String(vir.species || '').trim())
+        && /^(average build|slim|fit|tall)?$/i.test(String(vir.build || '').trim());
+    const weakOutfit = !Array.isArray(vir.outfit) || vir.outfit.length < 2
+        || vir.outfit.some(x => /^(casual dark clothes|casual clothes|clothes|outfit)$/i.test(String(x).trim()));
+    return weakBody || weakOutfit || !vir.hair || !vir.eyes || !vir.skin_fur_scales;
 }
 
 // Seed (or refresh) the {{user}} persona VIR entry and pin it.
@@ -699,15 +784,17 @@ function seedUserPersonaVir(worldName, data) {
         if (!vir) return;
 
         const existing = findCharacterEntry(data, personaName);
+        let finalVir = vir;
         if (existing) {
             // Don't clobber an entry the AI has already enriched — only seed
             // if the entry still looks like a bare seed (no AI delta yet).
             const existingVir = parseActiveVir(existing.content || '');
-            const aiEnriched = existingVir.outfit?.length > 1 || existingVir.hair_state ||
-                existingVir.condition || existingVir.holding;
+            const aiEnriched = !isWeakUserVir(existingVir) && (existingVir.hair_state ||
+                existingVir.condition || existingVir.holding);
             if (aiEnriched) return;
+            finalVir = mergeVir(existingVir, vir);
         }
-        const entry = upsertCharacter(data, personaName, { vir });
+        const entry = upsertCharacter(data, personaName, { vir: finalVir });
         if (!entry) return;
         // Tag so we can recognise the user persona entry later.
         entry.comment = `VIR: ${personaName}`;
@@ -1278,7 +1365,37 @@ async function cleanupVirForDeletedChat(chatId) {
 // chosen depths.
 const VIR_CONTRACT_DEPTH = 4;
 const VIR_STATE_DEPTH = 2;
+// PRIORITY reminder injected at depth 1 — sits between the user's last
+// message and the assistant's response, making it the FRESHEST instruction
+// the model sees. Content scales with miss count.
+const VIR_PRIORITY_DEPTH = 1;
 const POSITION_IN_CHAT = 2;
+
+// ── Escalating priority reminder (depth-1 anti-miss) ─────────────────────────
+// Three tiers. Default (no misses): a tiny pin so the rule stays fresh.
+// After 1 miss: a short escalation. After 2+: a strong warning that quotes
+// the miss back at the AI.
+function buildPriorityReminder() {
+    const st = settings();
+    const misses = Math.max(0, st.consecutiveMisses || 0);
+    if (misses === 0) {
+        // Tiny anchor — 15 tokens. Keeps the rule in fresh attention without bloat.
+        return `[VIR REMINDER] End this reply with one \`\`\`vir code-fence as the absolute last line. Even an empty delta needs the fence.`;
+    }
+    if (misses === 1) {
+        return `[VIR PRIORITY \xe2\x80\x94 your previous reply did NOT contain a \`\`\`vir block. That is malformed.
+Every reply MUST end with one \`\`\`vir code-fence as the absolute last thing in the visible reply (not inside reasoning, not inside <details>).
+Schema: {"schema":3,"characters":[{"name":"...","action":"create|update",<fields>}],"scene":{...}}
+If nothing changed for any character, still emit: {"schema":3,"characters":[],"scene":{...}}
+[END VIR PRIORITY]`;
+    }
+    // 2+ consecutive misses — strongest escalation
+    return `[VIR PRIORITY \xe2\x80\x94 CRITICAL: your last ${misses} replies have skipped the \`\`\`vir block. The HUD has no record of recent state changes \xe2\x80\x94 characters are visually drifting because of this.
+FIX NOW: this reply MUST end with one \`\`\`vir code-fence as the absolute LAST thing in the visible message. NOT in your reasoning. NOT inside <think>. NOT inside <details>. As literal markdown at the bottom of your prose.
+Required schema: {"schema":3,"characters":[{"name":"<who is in scene or whose state changed>","action":"create|update",<at minimum: outfit, pose, expression, condition>}],"scene":{"location":"...","time":"...","active":"<comma-separated names in scene>"}}
+A reply that ends with anything other than \`\`\`vir is MALFORMED and will be rejected. End with the fence.
+[END VIR PRIORITY]`;
+}
 
 function injectVirContract() {
     if (!settings().enabled || !settings().contractInjection) return;
@@ -1286,11 +1403,12 @@ function injectVirContract() {
         const ctx = getContext();
         const setExtensionPrompt = ctx?.setExtensionPrompt || window.setExtensionPrompt;
         if (typeof setExtensionPrompt !== 'function') return;
-        // IN_CHAT depth 4 — sits 4 messages from the end of the chat stream
-        // as a system reminder. Far enough from the user input that it acts
-        // as background reference; close enough that the AI consults it.
+        // Main contract at depth 4 (full reference).
         setExtensionPrompt('FF4_VIR_CONTRACT', VIR_CONTRACT, POSITION_IN_CHAT, VIR_CONTRACT_DEPTH, false, 'system');
-        log(`VIR contract injected IN_CHAT depth ${VIR_CONTRACT_DEPTH}`);
+        // Priority reminder at depth 1 — fresh attention anchor. Escalates if AI keeps missing.
+        const priority = buildPriorityReminder();
+        setExtensionPrompt('FF4_VIR_PRIORITY', priority, POSITION_IN_CHAT, VIR_PRIORITY_DEPTH, false, 'system');
+        log(`VIR contract injected IN_CHAT depth ${VIR_CONTRACT_DEPTH} | priority depth ${VIR_PRIORITY_DEPTH} (misses=${settings().consecutiveMisses||0})`);
     } catch (e) { warn('Contract injection failed', e); }
 }
 function clearVirContract() {
@@ -1300,6 +1418,7 @@ function clearVirContract() {
         if (typeof setExtensionPrompt !== 'function') return;
         setExtensionPrompt('FF4_VIR_CONTRACT', '', POSITION_IN_CHAT, VIR_CONTRACT_DEPTH);
         setExtensionPrompt('FF4_VIR_STATE', '', POSITION_IN_CHAT, VIR_STATE_DEPTH);
+        setExtensionPrompt('FF4_VIR_PRIORITY', '', POSITION_IN_CHAT, VIR_PRIORITY_DEPTH);
     } catch { /* ignore */ }
 }
 
@@ -1316,24 +1435,67 @@ async function buildVirStateText() {
     if (!data) return '';
 
     const allChars = characterEntries(data);
-    if (!allChars.length) return '';
 
     const lines = ['=== VIR WORLD STATE ==='];
+
+    const userName = canonicalizeName(String(name1 || '')).canonical;
+    const userEntry = userName ? allChars.find(([, entry]) => characterEntryName(entry) === userName)?.[1] : null;
+    const userVir = userEntry ? parseActiveVir(userEntry.content || '') : {};
+    const activePersonaText = String(power_user?.persona_description || '').trim();
+    if (userName && (!userEntry || isWeakUserVir(userVir))) {
+        lines.push('[USER VIR REPAIR NEEDED]');
+        lines.push(`User character name: ${userName}`);
+        if (activePersonaText) {
+            lines.push('Use active persona description plus current card/scenario/story evidence to create or update this user VIR.');
+        } else {
+            lines.push('Active persona description is empty. Create or update this user VIR from current card, scenario, first message, and visible story/chat evidence only.');
+        }
+        lines.push('Do not use other saved personas, unrelated chats, or memory from other sessions.');
+        lines.push('Emit a schema 3 characters[] create/update for the user this turn with full visual fields: species, age_appearance, height, build, hair, eyes, skin_fur_scales, face_features, body, outfit, accessories, pose, expression, location_context.');
+        lines.push('If exact clothing is not stated, infer the most plausible current outfit from the current scene and keep it stable until the story changes it.');
+        lines.push('[/USER VIR REPAIR NEEDED]');
+    }
+
+    const promptLockNames = allChars
+        .filter(([, entry]) => entry?.constant !== false)
+        .map(([, entry]) => characterEntryName(entry))
+        .filter(Boolean);
+    if (promptLockNames.length) {
+        lines.push('[VIR PROMPT LOCK]');
+        lines.push(`Character block order for <pic> prompts: ${promptLockNames.join(' -> ')}`);
+        lines.push('Do not reshuffle this order on retries unless the prose explicitly gives a new left/right layout.');
+        lines.push('Use physical positions from position/location/pose first: behind counter, in front of counter, doorway, background, beside bed. Do not invent left/right when a better physical slot exists.');
+        lines.push('Copy each PIC_COPY line as the visual identity source; only pose, expression, and condition may change when the current beat changes.');
+        lines.push('[/VIR PROMPT LOCK]');
+    }
 
     // Character cards (compact one-block per char)
     for (const [, entry] of allChars) {
         const name = characterEntryName(entry);
         if (!name) continue;
         const vir = parseActiveVir(entry.content || '');
+        const picCopy = buildPicParagraph(name, vir) || extractPicCopy(entry.content || '');
         const card = [
             `  ${name}:`,
+            picCopy ? `    pic_copy: ${picCopy}` : '',
             vir.species ? `    species: ${vir.species}` : '',
+            vir.source ? `    source: ${vir.source}` : '',
+            vir.age_appearance ? `    age: ${vir.age_appearance}` : '',
+            vir.height ? `    height: ${vir.height}` : '',
+            vir.build ? `    build: ${vir.build}` : '',
             vir.hair ? `    hair: ${vir.hair}` : '',
+            vir.hair_state ? `    hair_now: ${vir.hair_state}` : '',
             vir.eyes ? `    eyes: ${vir.eyes}` : '',
             vir.skin_fur_scales ? `    skin: ${vir.skin_fur_scales}` : '',
+            vir.face_features ? `    face: ${vir.face_features}` : '',
             vir.body ? `    body: ${vir.body}` : '',
             vir.marks ? `    marks: ${vir.marks}` : '',
             Array.isArray(vir.outfit) && vir.outfit.length ? `    outfit: ${vir.outfit.join('; ')}` : '',
+            Array.isArray(vir.accessories) && vir.accessories.length ? `    accessories: ${vir.accessories.join('; ')}` : '',
+            vir.pose ? `    pose: ${vir.pose}` : '',
+            vir.expression ? `    expression: ${vir.expression}` : '',
+            vir.condition ? `    condition: ${vir.condition}` : '',
+            vir.location_context ? `    position: ${vir.location_context}` : '',
             vir.voice_lock?.dialogue_color ? `    dialogue_color: ${vir.voice_lock.dialogue_color}` : '',
         ].filter(Boolean);
         lines.push(...card);
@@ -1556,6 +1718,32 @@ async function handleGenerationEnded() {
         // Parse VIR data
         let processedRaw = [];
         try { processedRaw = await processMessageData(i) || []; } catch (e) { error('handleGenerationEnded parse:', e); }
+
+        // ── Miss tracking: count consecutive turns with NO parsed vir block.
+        //    When AI starts skipping the fence (common after many turns),
+        //    escalate the depth-1 priority reminder. Reset on successful parse.
+        try {
+            const st = settings();
+            const sigPresent = !!(msg.extra && msg.extra[EXT] && Array.isArray(msg.extra[EXT].processed) && msg.extra[EXT].processed.length);
+            const messageHadAnyVirContent = /```vir|<vir_sync|"schema"\s*:\s*3/.test(msg.mes || '');
+            if (processedRaw.length > 0 || sigPresent || messageHadAnyVirContent) {
+                if ((st.consecutiveMisses || 0) > 0) {
+                    log(`VIR parsed — resetting miss counter (was ${st.consecutiveMisses})`);
+                }
+                st.consecutiveMisses = 0;
+            } else {
+                // True miss — AI sent a substantive reply with no vir content at all
+                const wordCount = (msg.mes || '').trim().split(/\s+/).length;
+                if (wordCount > 40) {
+                    st.consecutiveMisses = (st.consecutiveMisses || 0) + 1;
+                    st.totalMisses = (st.totalMisses || 0) + 1;
+                    warn(`VIR miss #${st.consecutiveMisses} (total ${st.totalMisses}) — escalating depth-1 reminder`);
+                }
+            }
+            saveSettingsDebounced();
+            // Re-inject contract + escalated priority for the NEXT turn
+            injectVirContract();
+        } catch (e) { warn('miss tracking failed:', e); }
 
         // Fetch fresh mes! Another extension (like st-image-auto-generation) might
         // have modified msg.mes during the await above. Using a stale string here
