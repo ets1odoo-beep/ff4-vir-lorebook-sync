@@ -386,6 +386,7 @@ function enforceVirRecursionFlags(entry) {
     if (!entry) return entry;
     entry.excludeRecursion = true;
     entry.preventRecursion = true;
+    entry.scanDepth = 3;
     return entry;
 }
 
