@@ -86,6 +86,10 @@ const defaultSettings = {
     contractInjection: true,         // auto-inject VIR contract via setExtensionPrompt
     seedUserPersona: true,           // auto-seed a pinned VIR entry from the active persona
     recallTurnsDefault: 8,           // longer than v4 for better long-term memory
+    templateMode: 'Detailed',
+    diagnosticsEnabled: true,
+    sheetCommandMode: 'Detailed',
+    lastInjectionPreview: '',
     worldChatMap: {},
     pinnedCharacters: {},
     recallCharacters: {},
@@ -96,10 +100,31 @@ const defaultSettings = {
     // ── v5.4 miss tracking (escalating depth-1 reminder) ──
     consecutiveMisses: 0,            // streak of recent turns with no vir block
     totalMisses: 0,                  // lifetime counter across all chats (debug aid)
+    // ── v5.5 dialogue colour application ──
+    dialogueColorEnabled: false,     // colour the .name_text label per voice_lock.dialogue_color
 };
 const MAX_RECENT_WARNINGS = 10;
 let processingQueue = Promise.resolve();
 let sessionPacketCount = 0;
+
+const VIR_TEMPLATE_MODES = {
+    Compact: {
+        label: 'Compact',
+        note: 'Keep VIR packets short. Update only fields that visibly changed. Prefer concise PIC_COPY-compatible values.',
+    },
+    Detailed: {
+        label: 'Detailed',
+        note: 'Use full visual identity detail when creating or repairing characters. Preserve stable fields exactly after creation.',
+    },
+    'VN Director': {
+        label: 'VN Director',
+        note: 'Track visual state like a VN continuity bible: scene position, expression, outfit, condition, and active cast must stay current.',
+    },
+    'Image Heavy': {
+        label: 'Image Heavy',
+        note: 'Prioritize image consistency: full_name, source, hair, face, marks, outfit pieces, accessories, pose, expression, and condition must be complete.',
+    },
+};
 
 // ============================================================================
 // THE VIR CONTRACT — auto-injected as system prompt every generation
@@ -112,7 +137,7 @@ let sessionPacketCount = 0;
 // palette, output order, FORBIDDEN/CORRECT) still live in the user's preset.
 const VIR_CONTRACT = `[VIR TRACKING CONTRACT — visual identity registry]
 
-End EVERY reply with exactly one \`\`\`vir code-fence block as the absolute last thing in the message (after prose, after all <pic> tags, after any other tracker block). One line of flat JSON, schema 3:
+End EVERY reply with exactly one \`\`\`vir code-fence block in the visible message — placed AFTER prose, AFTER all <pic> tags, AFTER the STATS UPDATE section. If another tracker code-fence is also required (e.g. \`\`\`rpg from an RPG STATE TRACKER), that other tracker takes the FINAL slot and \`\`\`vir comes immediately before it. VIR's parser does not care about absolute final position — it only needs to find \`\`\`vir somewhere in the visible reply. One line of flat JSON, schema 3:
 {"schema":3,"characters":[{"name":"...","action":"create|update",<flat fields>}],"scene":{"location":"...","time":"...","active":"Name1,Name2"},"states":[{"name":"...","position":"...","aftermath":0}],"recall":[]}
 Flat name-keyed objects only — never nest objects under a name, never nest voice_lock. Multi-piece fields (outfit, accessories, equipment, underwear) are SEMICOLON-separated strings.
 
@@ -121,8 +146,9 @@ WHY DETAIL MATTERS: the VIR is the single source of truth that every <pic> tag c
 PER-CHARACTER FIELDS:
 
 STABLE FIELDS (emit fully on first 'create'; only change when the STORY explicitly causes it — same causality rule as stat deltas: no story event = no change):
+- full_name: full canon/display name if known. Use the show/card/original character name, not a short nickname.
 - species: e.g. "adult human female", "anthro arctic fox male", "slime girl", "dryad"
-- source: canon franchise or "original character"
+- source: full canon franchise/show/game/VN/source name, or exactly "original character" if the character has no source. Do not invent a source.
 - age_appearance, height, build: "looks mid-20s", "168 cm", "slim hourglass, soft tummy"
 - body_material: WHAT THE BODY IS MADE OF. MANDATORY for any non-human species — this is the #1 cause of wrong renders. A slime girl is NOT a human with coloured skin; a dryad is NOT a human with green skin. State the substance + texture + how it behaves:
     slime girl  → "entire body is translucent blue-green gel, soft and jiggly, no skeleton, deformable, light refracts through her, surface glistens wet"
@@ -130,13 +156,30 @@ STABLE FIELDS (emit fully on first 'create'; only change when the STORY explicit
     ghost       → "semi-transparent pale vapour, lower body fades to mist, no solid mass, faint inner glow"
     For an ordinary human, leave body_material empty.
 Use plain simple words for all fields — the kind a child knows. No fancy or rare words.
-- hair: colour + length + texture — "light yellow, very long, straight, with a short fringe"; "short dark brown, slightly wavy"
-- eyes: colour + basic shape — "pale grey, almond shaped"; "bright green, round"
-- skin: plain colour + surface — "tan skin"; "pale skin"; "soft orange fur all over"
-- face_features: plain short sentences — "small flat nose"; "round cheeks"; "thin lips"; "small freckles on her nose"
-- body: plain shape words — "medium breasts, narrow waist, wide hips"; "flat chest, lean arms, broad shoulders"
-- marks: plain and specific — "thin scar above left eyebrow"; "small dark mole below right eye"; "star tattoo on left wrist"
-- non_human: plain — "long pointed ears"; "fluffy cat tail"; "two small grey horns on forehead"
+DETAIL FLOOR — EVERY anchor below must be filled per character. Vague values cause "looks different in every pic". Aim for 6-10 concrete attributes per visual field, not 2-3. Specific words beat generic ones (chocolate-brown > brown, mid-calf > tall, twelve-eyelet lace-up > laced).
+
+- hair: shade + length to a body landmark + texture + styling + parting + fringe/bang + distinguishing detail.
+    DETAIL FLOOR: "honey-blonde with lighter sun-bleached tips, falls to mid-back when down, straight with a slight wave at the ends, parted on the right, side-swept fringe brushing the brow, one thin braid behind the left ear"
+    TOO THIN (do not write this): "long blonde, straight, with a fringe"
+- eyes: specific shade + secondary tone + shape + size + lash detail + distinguishing detail.
+    DETAIL FLOOR: "warm forest-green with a darker emerald ring around the iris, almond-shaped, slightly upturned at the outer corner, average size, long thick natural lashes, faint laugh lines at the outer corner"
+    TOO THIN: "green, round"
+- skin: specific tone + undertone + texture + distinguishing skin features.
+    DETAIL FLOOR: "warm light-olive skin with peach undertone, smooth except for a small constellation of light freckles across the bridge of the nose and onto both cheekbones, faint tan line at the upper arms"
+    For fur/scales: "soft burnt-orange fur over the back and head fading to cream on the chest and belly, sleek short fur with longer ruff at the neck, three thin darker brown stripes on the upper arms"
+    TOO THIN: "tan skin" / "orange fur"
+- face_features: nose + cheeks + lips + jaw + chin + ears (if not non_human) + brow + distinguishing micro-features.
+    DETAIL FLOOR: "small straight nose with a slight upturn at the tip, soft full cheeks, naturally rosy heart-shaped lips with a defined cupid's bow, narrow rounded jaw, small pointed chin, small attached earlobes, slim natural brow with a small mole at the outer end of the left one"
+    TOO THIN: "small nose, round cheeks, thin lips"
+- body: shoulders + chest + waist + hips + arms + legs + posture-relevant details.
+    DETAIL FLOOR: "narrow sloping shoulders, full C-cup breasts with a small natural sag, defined narrow waist (hourglass ratio), wide rounded hips, slender arms with soft definition, long shapely legs with toned thighs and slim calves"
+    TOO THIN: "medium breasts, narrow waist, wide hips"
+- marks: type + size + exact shape + EXACT placement (which side, where relative to anatomical landmarks) + colour + age/healing.
+    DETAIL FLOOR: "thin pale-pink one-inch crescent scar two cm above the outer end of the left eyebrow, faded and slightly raised; small dark-brown round mole on the right cheek halfway between the corner of the mouth and the ear; black-ink five-pointed star tattoo on the inside of the left wrist, two cm wide, fully healed and saturated"
+    TOO THIN: "scar above eyebrow"
+- non_human: type + size + colour + placement + distinguishing detail.
+    DETAIL FLOOR: "long pointed cat ears set high on the head, soft inner fur a paler pink-cream, outer fur matching her hair colour, the left ear has a small notch on its outer edge; long fluffy fox tail starting at the base of the spine, the same orange as her hair fading to a white tip, held with a slight upward curve at the base"
+    TOO THIN: "pointed cat ears, long fluffy tail"
 
 FIELD PERSISTENCE — THE ANTI-DRIFT RULE:
 Every field value, once written, persists unchanged until you emit an explicit update for it. If you did not write an update this turn, the field is identical to last turn — copy it forward unchanged. A field does not silently gain or lose content. Glasses that appeared last turn stay on. Glasses never mentioned stay off. A scar that was established stays. An accessory not in the VIR does not appear. The VIR is a record of what the story established, not a creative canvas.
@@ -146,12 +189,18 @@ CURRENT STATE (update the MOMENT it changes — this is what keeps pics consiste
 FIELD QUALITY RULE: write every field value in short, plain, simple words — the kind a child knows. The values feed a small image encoder that cannot handle rare or fancy words. Colour + basic material + item name + simple shape is enough. No literary words.
 
 - hair_state: how the hair sits RIGHT NOW — "tied up in a high ponytail", "wet and flat against her shoulders", "loose and messy with strands in her face"
-- outfit: EVERY worn piece as colour + basic material + item + shape. Semicolon-separate each piece.
-    GOOD: "brown leather vest; white cloth shirt with sleeves rolled up; dark grey pants; tall brown boots"
-    BAD:  "practical adventurer clothes" / "casual outfit" / "adventurer gear" — NEVER use vague group labels. List every piece. If unsure, pick the most plausible thing and describe it plainly.
-- underwear: emit when visible or removed — "black bra with thin straps; black underwear"
-- accessories: each item simply — "small silver hoop earrings; thin leather belt with a metal buckle; plain ring on right hand". If none: omit the field entirely.
-- equipment / holding: simple and specific — "short sword in a belt scabbard", "hot mug in right hand"
+- outfit: EVERY worn piece, semicolon-separated, with the FULL anchor set per piece — colour shade + material + item type + cut/sleeve/neckline + fit + length + closure/fastening + distinguishing detail. The model paints what the words paint; if a piece has only 3 anchors, the model invents the other 5 differently every pic.
+    DETAIL FLOOR (good): "chocolate-brown distressed buttery leather vest, fitted at the waist, asymmetric front zip with brass teeth running from right hip up to the left collarbone, two slim chest pockets, sleeveless with a narrow lapel; cream-white linen long-sleeve shirt under the vest, banded collar, sleeves rolled to mid-forearm showing the inner cuff; charcoal-grey wool trousers, slim straight leg, ankle-length with no cuff, sits at the natural waist, plain front no pleats; warm tan distressed leather boots, mid-calf height ending two finger-widths below the knee, twelve-eyelet front lace-up crossed in an X pattern with leather cord, low block heel, rounded toe, slight scuff on the right toe cap"
+    TOO THIN (do NOT write): "brown leather vest; white shirt; dark grey pants; tall brown boots" — every word here is a hole the model fills differently each render.
+    BAD (NEVER): "practical adventurer clothes" / "casual outfit" / "leather top and pants" / "boots" — these are not pieces, they are labels.
+    For footwear specifically, ALWAYS include: height (ankle / mid-calf / knee-high / over-the-knee / thigh-high) + closure (lace-up with N eyelets / side-zip / slip-on / buckle) + heel (flat / low block / mid stiletto / chunky platform) + toe (round / pointed / square / open).
+- underwear: same detail floor as outfit. "matte black satin bra with thin spaghetti straps, half-cup balconette shape, thin lace trim along the upper edge, small bow at the centre; matching matte black satin high-cut briefs, mid-rise, thin bow at each hip"
+    TOO THIN: "black bra; black underwear"
+- accessories: type + material + colour + placement (which finger/ear/wrist/neck) + size + distinguishing detail. Per-item, semicolon-separated.
+    DETAIL FLOOR: "small polished silver hoop earrings, eight mm diameter, one in the lower lobe of each ear; thin antique-brass twisted-rope belt around the natural waist, oval buckle stamped with a leaf motif, belt holes punched at regular intervals; plain matte gold band ring on the right ring finger, three mm wide"
+    TOO THIN: "silver earrings; leather belt; ring"
+    If none worn: omit the field entirely. NEVER invent.
+- equipment / holding: same — "weathered short sword in a worn dark-brown leather scabbard belted at the left hip, brass pommel shaped like an oak leaf"; "white ceramic mug filled with dark coffee, gripped in the right hand by the handle"
 - pose: plain posture in a few short words — "standing at the counter, right hand flat on the top, looking left"
 - expression: face in simple words — "small smile, eyes a little narrow, head tilted right"
 - condition: every visible mark right now — "sweat on forehead; lipstick smeared on lower lip; small bruise on left cheek; mud on right boot"
@@ -234,7 +283,7 @@ RECOVERY:
 When a stat moves back toward baseline (rest, healing, comfort), CLEAR the matching descriptors from condition/pose — don’t just stop adding new ones, or the character stays visually exhausted forever.
 
 [FINAL CHECK — DO THIS RIGHT BEFORE SENDING]
-1. Does your reply end with a \`\`\`vir block as the absolute last thing? (Yes/no)
+1. Does your reply contain a \`\`\`vir code-fence in the VISIBLE message (not in reasoning, not in <details>), placed AFTER prose, AFTER pic tags, AFTER STATS UPDATE? \`\`\`vir does NOT have to be the absolute last block if another tracker (e.g. \`\`\`rpg) also requires the last slot — in that case let the other tracker close the message and put \`\`\`vir just before it. (Yes/no)
 2. Does it ALSO contain a "─── STATS UPDATE ───" section, placed just before that \`\`\`vir block? (Yes/no)
 3. If any stat moved this turn, does every bullet have a one-line reason citing a concrete event from THIS turn?
 4. If any stat moved, did the SAME deltas also produce a condition / pose / expression update inside the \`\`\`vir block for that character?
@@ -333,6 +382,13 @@ function makeEntry({ uid, key, comment, content, constant = false, disable = fal
     };
 }
 
+function enforceVirRecursionFlags(entry) {
+    if (!entry) return entry;
+    entry.excludeRecursion = true;
+    entry.preventRecursion = true;
+    return entry;
+}
+
 // ============================================================================
 // VIR CONTENT GENERATION
 // ============================================================================
@@ -375,9 +431,31 @@ function genderPronoun(vir) {
     return 'they';
 }
 
+function canonicalCharacterName(name, vir = {}) {
+    return compactValue(vir.full_name || vir.canon_name || vir.display_name || vir.original_name || name);
+}
+
+function canonicalSourceName(vir = {}) {
+    return compactValue(vir.source || vir.franchise || vir.series || vir.show || vir.game || vir.vn || vir.origin);
+}
+
+function isOriginalSource(src) {
+    return /^(original character|original|oc|own character|custom character|user original)$/i.test(String(src || '').trim());
+}
+
+function buildPicIdentity(name, vir = {}) {
+    const fullName = canonicalCharacterName(name, vir);
+    const source = canonicalSourceName(vir);
+    if (!fullName && !source) return '';
+    if (!source) return fullName;
+    if (isOriginalSource(source)) return `${fullName}, an original character`;
+    return `${fullName} from ${source}`;
+}
+
 function buildPicParagraph(name, vir) {
     const p = genderPronoun(vir);
     const P = p === 'they' ? 'They' : p === 'she' ? 'She' : 'He';
+    const possessive = p === 'they' ? 'Their' : p === 'she' ? 'Her' : 'His';
     const skin = vir.skin_fur_scales || vir.skin || vir.fur || vir.scales;
     const anatomy = vir.anatomy || vir.genitals || vir.nsfw_anatomy;
     const condition = compactValue([
@@ -404,6 +482,8 @@ function buildPicParagraph(name, vir) {
     const an = (word) => /^[aeiou]/i.test(word) ? 'an' : 'a';
 
     // Identity
+    const picIdentity = buildPicIdentity(name, vir);
+    if (picIdentity) add(picIdentity);
     const sp = compactValue(vir.species || vir.species_class);
     if (sp) {
         const bits = splitPackedFacts(sp);
@@ -414,17 +494,15 @@ function buildPicParagraph(name, vir) {
             add(`${P} is ${an(sp)} ${sp}`);
         }
     }
-    const src = compactValue(vir.source || vir.franchise);
-    if (src) add(`${P} is ${an(src)} ${src}`);
     if (vir.age_appearance) add(String(vir.age_appearance).trim().toLowerCase().startsWith('looks ') ? `${P} ${vir.age_appearance}` : `${P} looks ${vir.age_appearance}`);
     if (vir.height) add(`${P} is ${vir.height} tall`);
     // build separate from body to avoid double-printing
     if (vir.build) add(`${P} has a ${compactValue(vir.build)} build`);
     const bodyDetail = compactValue([vir.body, anatomy]);
     if (bodyDetail) add(`${P} has ${bodyDetail}`);
-    // Non-human body material — must come before skin
+    // Non-human body material — must come before skin. NL form, no label.
     const mat = compactValue(vir.body_material || vir.composition || vir.material);
-    if (mat) add(`${P} body material: ${mat}`);
+    if (mat) add(`${possessive} body is ${mat}`);
     // Hair
     if (vir.hair) {
         const hs = hairNow && hairNow !== 'neat, default' && hairNow !== compactValue(vir.hair)
@@ -433,30 +511,69 @@ function buildPicParagraph(name, vir) {
     }
     if (vir.eyes) add(`${P} has ${compactValue(vir.eyes)} eyes`);
     if (skin) add(`${P} has ${compactValue(skin)}`);
+
+    // NL conversion: no more "Face:", "Marks:", "Pose:" labels — Qwen 0.6B reads labels literally.
+    // Empty-equivalents ("none", "n/a") are SKIPPED so the encoder never paints "none" as content.
+    const NIL_RE = /^\s*(none|n\/?a|nothing|nil|nada|empty|—|-)\s*$/i;
+    const isNil = (v) => !v || NIL_RE.test(String(v).trim());
+    const addIfReal = (v, fmt) => { if (!isNil(v)) add(fmt(String(v).trim().replace(/\.+$/, ''))); };
+
     const ff = compactValue(vir.face_features || vir.face);
-    if (ff) add(`Face: ${ff}`);
+    addIfReal(ff, v => `${P} has ${v}`);
     const bl = compactValue(vir.brow_lash || vir.brows_lashes);
-    if (bl) add(`Brows/lashes: ${bl}`);
+    addIfReal(bl, v => `${P} has ${v}`);
     const lt = compactValue(vir.lips_teeth || vir.lips);
-    if (lt) add(`Lips/teeth: ${lt}`);
+    addIfReal(lt, v => `${P} has ${v}`);
     const hf = compactValue(vir.hands_feet || vir.hands);
-    if (hf) add(`Hands/feet: ${hf}`);
+    addIfReal(hf, v => `${P} has ${v}`);
     const nh = compactValue(vir.non_human || vir.limb_config);
-    if (nh) add(`${P} has ${nh}`);
+    addIfReal(nh, v => `${P} has ${v}`);
     const mk = compactValue(vir.marks);
-    if (mk) add(`Marks: ${mk}`);
-    // Current state
-    if (outfitParts.length) add(`${P} wears: ${outfitParts.join('; ')}`);
-    if (underwearParts.length) add(`Underwear: ${underwearParts.join('; ')}`);
-    if (accParts.length) add(`Accessories: ${accParts.join('; ')}`);
-    if (eqParts.length) add(`Equipment: ${eqParts.join('; ')}`);
+    addIfReal(mk, v => `${P} has ${v}`);
+
+    // Outfit / underwear / accessories / equipment: join pieces with semicolons for boundary
+    // preservation while keeping the whole sentence flowing (no "Label:" prefix).
+    // Special case: "naked"/"nude" as a piece → render as "is naked" not "wears naked".
+    const nakedTokens = /^\s*(naked|nude|fully nude|completely nude)\s*$/i;
+    const realOutfit = outfitParts.filter(p => !isNil(p) && !nakedTokens.test(p));
+    const isNaked = outfitParts.some(p => nakedTokens.test(p));
+    if (isNaked && !realOutfit.length) add(`${P} is naked`);
+    else if (isNaked && realOutfit.length) add(`${P} is mostly naked, with ${realOutfit.join('; ')} still on or nearby`);
+    else if (realOutfit.length) add(`${P} wears ${realOutfit.join('; ')}`);
+
+    const realUnderwear = underwearParts.filter(p => !isNil(p));
+    if (realUnderwear.length) add(`${P} wears ${realUnderwear.join('; ')} as underwear`);
+
+    const realAcc = accParts.filter(p => !isNil(p));
+    if (realAcc.length) add(`${P} wears ${realAcc.join('; ')}`);
+
+    const realEq = eqParts.filter(p => !isNil(p));
+    if (realEq.length) add(`${P} carries ${realEq.join('; ')}`);
+
     const holding = compactValue(vir.holding || vir.held_items || vir.in_hands);
-    if (holding) add(`${P} holds: ${holding}`);
+    addIfReal(holding, v => `${P} holds ${v}`);
+
+    // Pose: detect verb-starts ("sitting") → "She is sitting"; otherwise raw → "She <pose>".
     const pose = compactValue(vir.pose || vir.posture || vir.posture_voice);
-    if (pose) add(`Pose: ${pose}`);
+    if (!isNil(pose)) {
+        const poseLower = pose.trim().toLowerCase();
+        const verbStart = /^(sitting|standing|kneeling|lying|leaning|walking|running|crouching|squatting|crawling|straddling|riding|bent|bending|laid|laying|seated|perched|on her|on his|on their|hands? |arms? |knees?\b|legs?\b)/;
+        add(verbStart.test(poseLower) ? `${P} is ${pose}` : `${P} ${pose}`);
+    }
+
+    // Expression: detect verb-starts ("smiling") → "She is smiling"; otherwise → "She has <expr>".
     const expr = compactValue(vir.expression || vir.default_expression);
-    if (expr) add(`Expression: ${expr}`);
-    if (condition) add(`Condition: ${condition}`);
+    if (!isNil(expr)) {
+        const exprLower = expr.trim().toLowerCase();
+        const verbStart = /^(smiling|frowning|grinning|crying|laughing|smirking|pouting|scowling|glaring|staring|blushing|gasping|moaning|biting|licking)/;
+        if (verbStart.test(exprLower)) add(`${P} is ${expr}`);
+        else if (exprLower.startsWith('mouth ') || exprLower.startsWith('eyes ') || exprLower.startsWith('lips ') || exprLower.startsWith('brow')) add(`${possessive} ${expr}`);
+        else add(`${P} has ${expr}`);
+    }
+
+    // Condition: skip "normal" / "fine" / "okay" — those have nothing visual to render.
+    const NEUTRAL_COND = /^\s*(normal|fine|okay|ok|good|nothing visible|clear)\s*\.?$/i;
+    if (condition && !NEUTRAL_COND.test(condition.trim())) add(`${P} has ${condition}`);
 
     return s.join(' ');
 }
@@ -474,7 +591,8 @@ function lockedVisualCard(name, vir = {}) {
     const lines = [
         `[LOCKED VISUAL CARD: ${name}]`,
         `# --- STABLE IDENTITY (changes only when story drives it) ---`,
-        `IDENTITY: ${compactValue([vir.species || vir.species_class, vir.source || vir.franchise, vir.age_appearance, vir.height, vir.build])}`,
+        `PIC_IDENTITY: ${buildPicIdentity(name, vir)}`,
+        `IDENTITY: ${compactValue([vir.species || vir.species_class, canonicalSourceName(vir), vir.age_appearance, vir.height, vir.build])}`,
         `BODY_MATERIAL: ${compactValue(vir.body_material || vir.composition || vir.material)}`,
         `HAIR: ${compactValue(vir.hair)}`,
         `EYES: ${compactValue(vir.eyes)}`,
@@ -511,8 +629,10 @@ function lockedVisualCard(name, vir = {}) {
 function characterContent(name, payload = {}) {
     const vir = payload.vir || payload;
     const picPara = buildPicParagraph(name, vir);
+    const picIdentity = buildPicIdentity(name, vir);
     return `[ACTIVE VIR: ${name}]
 When writing a <pic> that includes ${name}, copy the [PIC COPY] paragraph below verbatim — do not paraphrase, shorten, or invent. Adjust only pose/expression/condition to match the current visual beat.
+Canonical name+source for image prompts: ${picIdentity || name}
 [PIC COPY: ${name}]
 ${picPara}
 [/PIC COPY]
@@ -638,17 +758,18 @@ function upsertCharacter(data, name, payload) {
     let entry = findCharacterEntry(data, name);
     if (!entry) {
         const uid = nextUid(data);
-        entry = makeEntry({
+        entry = enforceVirRecursionFlags(makeEntry({
             uid, key, comment: `VIR: ${name}`, content: characterContent(name, { vir }),
             constant: false,  // tier system applies actual constant flag
             order: TIER.OFFSCREEN.order, depth: TIER.OFFSCREEN.depth, position: 4,
-        });
+        }));
         entries[uid] = entry;
     } else {
         entry.key = uniqueClean([...(entry.key || []), ...key]);
         entry.comment = `VIR: ${name}`;
         entry.content = characterContent(name, { vir });
         entry.disable = false;
+        enforceVirRecursionFlags(entry);
     }
     return entry;
 }
@@ -658,6 +779,7 @@ function applyDelta(data, name, delta) {
     name = canonicalizeName(name, delta).canonical;
     const current = findCharacterEntry(data, name);
     const oldVir = current ? parseActiveVir(current.content) : {};
+    if (current) checkVirDrift(name, oldVir, delta);
     return upsertCharacter(data, name, { vir: mergeVir(oldVir, delta) });
 }
 
@@ -825,6 +947,7 @@ function setActiveFlags(data, activeNames, pinnedNames = new Set(), recallNames 
         if (!entry || entry.comment === 'FF4 VIR Rules' || entry.comment === 'FF4 FF4_STATE' || entry.comment === 'FF4 VIR Roster') continue;
         const name = characterEntryName(entry);
         if (!name) continue;
+        enforceVirRecursionFlags(entry);
         if (pinnedNames.has(name)) {
             entry.constant = true; entry.order = TIER.PINNED.order; entry.depth = TIER.PINNED.depth;
         } else if (activeNames.has(name)) {
@@ -946,14 +1069,13 @@ function rebuildRosterEntry(data) {
         // trigger every character VIR entry on every turn — destroying the
         // tier/selective system. excludeRecursion is belt-and-braces (nothing
         // should ever trigger an always-on entry).
-        entry = makeEntry({ uid, key: ['VIR_ROSTER'], comment: 'FF4 VIR Roster', content, constant: true, order: 43, depth: 1, position: 0, excludeRecursion: true, preventRecursion: true });
+        entry = enforceVirRecursionFlags(makeEntry({ uid, key: ['VIR_ROSTER'], comment: 'FF4 VIR Roster', content, constant: true, order: 43, depth: 1, position: 0, excludeRecursion: true, preventRecursion: true }));
         entries[uid] = entry;
     } else if (content) {
         entry.content = content;
         // Force-apply recursion flags on rebuild — rosters from pre-fix
         // versions lacked them and were cascade-triggering every char entry.
-        entry.excludeRecursion = true;
-        entry.preventRecursion = true;
+        enforceVirRecursionFlags(entry);
     } else {
         delete entries[entry.uid];
     }
@@ -1384,21 +1506,21 @@ function buildPriorityReminder() {
     const ANTI_AGENT = `[REASONING MODE: single-pass RP, not agent verify-loop. Apply rules silently \xe2\x80\x94 no rule-citation in reasoning, no draft-then-revise.]`;
     if (misses === 0) {
         return `${ANTI_AGENT}
-[VIR REMINDER] End this reply with one \`\`\`vir code-fence as the absolute last line. Even an empty delta needs the fence.`;
+[VIR REMINDER] Include one \`\`\`vir code-fence in the visible reply near the end (after STATS UPDATE; before any other tracker fence like \`\`\`rpg if present). Even an empty delta needs the fence.`;
     }
     if (misses === 1) {
         return `${ANTI_AGENT}
 [VIR PRIORITY \xe2\x80\x94 your previous reply did NOT contain a \`\`\`vir block. That is malformed.
-Every reply MUST end with one \`\`\`vir code-fence as the absolute last thing in the visible reply (not inside reasoning, not inside <details>).
+Every reply MUST include one \`\`\`vir code-fence in the VISIBLE message (not inside reasoning, not inside <details>). Place it AFTER prose, AFTER pic tags, AFTER STATS UPDATE, and BEFORE any other tracker fence (e.g. \`\`\`rpg). If no other tracker exists, \`\`\`vir is the final block. If \`\`\`rpg or similar tracker exists, it closes the message and \`\`\`vir comes right before it.
 Schema: {"schema":3,"characters":[{"name":"...","action":"create|update",<fields>}],"scene":{...}}
 If nothing changed for any character, still emit: {"schema":3,"characters":[],"scene":{...}}
 [END VIR PRIORITY]`;
     }
     return `${ANTI_AGENT}
 [VIR PRIORITY \xe2\x80\x94 CRITICAL: your last ${misses} replies have skipped the \`\`\`vir block. The HUD has no record of recent state changes \xe2\x80\x94 characters are visually drifting because of this.
-FIX NOW: this reply MUST end with one \`\`\`vir code-fence as the absolute LAST thing in the visible message. NOT in your reasoning. NOT inside <think>. NOT inside <details>. As literal markdown at the bottom of your prose.
+FIX NOW: this reply MUST include one \`\`\`vir code-fence in the VISIBLE message. NOT in your reasoning. NOT inside <think>. NOT inside <details>. As literal markdown near the bottom of your prose. Place it AFTER prose, AFTER pic tags, AFTER STATS UPDATE, and BEFORE any other tracker fence (e.g. \`\`\`rpg) if one exists. VIR does NOT need absolute-last position when another tracker also requires it \xe2\x80\x94 the other tracker takes the final slot and \`\`\`vir sits immediately before it.
 Required schema: {"schema":3,"characters":[{"name":"<who is in scene or whose state changed>","action":"create|update",<at minimum: outfit, pose, expression, condition>}],"scene":{"location":"...","time":"...","active":"<comma-separated names in scene>"}}
-A reply that ends with anything other than \`\`\`vir is MALFORMED and will be rejected. End with the fence.
+A reply that omits \`\`\`vir entirely is MALFORMED and will be rejected.
 [END VIR PRIORITY]`;
 }
 
@@ -1408,11 +1530,18 @@ function injectVirContract() {
         const ctx = getContext();
         const setExtensionPrompt = ctx?.setExtensionPrompt || window.setExtensionPrompt;
         if (typeof setExtensionPrompt !== 'function') return;
+        const mode = VIR_TEMPLATE_MODES[settings().templateMode] || VIR_TEMPLATE_MODES.Detailed;
+        const contract = `${VIR_CONTRACT}
+
+[VIR TEMPLATE MODE: ${mode.label}]
+${mode.note}
+[/VIR TEMPLATE MODE]`;
         // Main contract at depth 4 (full reference).
-        setExtensionPrompt('FF4_VIR_CONTRACT', VIR_CONTRACT, POSITION_IN_CHAT, VIR_CONTRACT_DEPTH, false, 'system');
+        setExtensionPrompt('FF4_VIR_CONTRACT', contract, POSITION_IN_CHAT, VIR_CONTRACT_DEPTH, false, 'system');
         // Priority reminder at depth 1 — fresh attention anchor. Escalates if AI keeps missing.
         const priority = buildPriorityReminder();
         setExtensionPrompt('FF4_VIR_PRIORITY', priority, POSITION_IN_CHAT, VIR_PRIORITY_DEPTH, false, 'system');
+        settings().lastInjectionPreview = `${contract.slice(0, 1200)}${contract.length > 1200 ? '\n...[truncated]' : ''}`;
         log(`VIR contract injected IN_CHAT depth ${VIR_CONTRACT_DEPTH} | priority depth ${VIR_PRIORITY_DEPTH} (misses=${settings().consecutiveMisses||0})`);
     } catch (e) { warn('Contract injection failed', e); }
 }
@@ -1470,7 +1599,7 @@ async function buildVirStateText() {
         lines.push(`Character block order for <pic> prompts: ${promptLockNames.join(' -> ')}`);
         lines.push('Do not reshuffle this order on retries unless the prose explicitly gives a new left/right layout.');
         lines.push('Use physical positions from position/location/pose first: behind counter, in front of counter, doorway, background, beside bed. Do not invent left/right when a better physical slot exists.');
-        lines.push('Copy each PIC_COPY line as the visual identity source; only pose, expression, and condition may change when the current beat changes.');
+        lines.push('Copy each PIC_COPY line as the visual identity source; keep the canonical "Full Name from Full Source Name" or "Full Name, an original character" wording intact. Only pose, expression, and condition may change when the current beat changes.');
         lines.push('[/VIR PROMPT LOCK]');
     }
 
@@ -1482,6 +1611,7 @@ async function buildVirStateText() {
         const picCopy = buildPicParagraph(name, vir) || extractPicCopy(entry.content || '');
         const card = [
             `  ${name}:`,
+            `    pic_identity: ${buildPicIdentity(name, vir) || name}`,
             picCopy ? `    pic_copy: ${picCopy}` : '',
             vir.species ? `    species: ${vir.species}` : '',
             vir.source ? `    source: ${vir.source}` : '',
@@ -1535,6 +1665,7 @@ async function injectVirState() {
             return;
         }
         setExtensionPrompt('FF4_VIR_STATE', text, POSITION_IN_CHAT, VIR_STATE_DEPTH, false, 'system');
+        settings().lastInjectionPreview = `${text.slice(0, 1200)}${text.length > 1200 ? '\n...[truncated]' : ''}`;
         log(`VIR state injected IN_CHAT depth ${VIR_STATE_DEPTH}`);
     } catch (e) { warn('State injection failed', e); }
 }
@@ -1830,6 +1961,209 @@ async function decayRecall() {
 // ============================================================================
 // SLASH COMMANDS (minimal — 5 essentials)
 // ============================================================================
+// ============================================================================
+// v5.5 — VIR utility commands (show / export / import / archive / restore)
+// ============================================================================
+const ARCHIVES_WORLD = 'FF4 VIR - Archives';
+
+async function loadArchivesWorld() {
+    let data = await loadWorldInfo(ARCHIVES_WORLD).catch(() => null);
+    if (!data) {
+        data = { entries: {} };
+        await saveWorldInfo(ARCHIVES_WORLD, data);
+        // Make sure ST sees the new world in its registry
+        try { await updateWorldInfoList?.(); } catch { /* ignore */ }
+    }
+    return data;
+}
+
+function printToChat(message) {
+    // Fall through to console if we can't post to chat — never throw.
+    try {
+        const ctx = getContext();
+        ctx?.sendSystemMessage
+            ? ctx.sendSystemMessage('generic', String(message || ''))
+            : console.log(`[${EXT}]`, message);
+    } catch (err) {
+        console.log(`[${EXT}]`, message, err?.message);
+    }
+}
+
+async function virshowCmd(args, value) {
+    const name = String(value || '').trim();
+    if (!name) return 'Usage: /virshow <Name>';
+    const worldName = currentWorldName();
+    if (!worldName) return 'No active chat.';
+    const data = await loadWorldInfo(worldName);
+    const entry = data ? findCharacterEntry(data, name) : null;
+    if (!entry) return `No VIR entry found for "${name}". Try /vir-list to see active names.`;
+    const vir = parseActiveVir(entry.content || '');
+    const picCopy = extractPicCopy(entry.content || '');
+    const lines = [`**VIR entry — ${characterEntryName(entry)}**`];
+    const printable = (k, v) => v ? lines.push(`- ${k}: ${Array.isArray(v) ? v.join('; ') : v}`) : null;
+    printable('full_name', vir.full_name);
+    printable('source', vir.source);
+    printable('species', vir.species);
+    printable('age_appearance', vir.age_appearance);
+    printable('height', vir.height);
+    printable('build', vir.build);
+    printable('body', vir.body);
+    printable('body_material', vir.body_material);
+    printable('hair', vir.hair);
+    printable('hair_state', vir.hair_state);
+    printable('eyes', vir.eyes);
+    printable('skin/fur/scales', vir.skin_fur_scales);
+    printable('face_features', vir.face_features);
+    printable('marks', vir.marks);
+    printable('non_human', vir.non_human);
+    printable('outfit', vir.outfit);
+    printable('underwear', vir.underwear);
+    printable('accessories', vir.accessories);
+    printable('equipment', vir.equipment);
+    printable('pose', vir.pose);
+    printable('expression', vir.expression);
+    printable('condition', vir.condition);
+    printable('location_context', vir.location_context);
+    if (vir.voice_lock?.dialogue_color) lines.push(`- dialogue_color: ${vir.voice_lock.dialogue_color}`);
+    if (picCopy) lines.push('', '**PIC COPY:**', picCopy);
+    printToChat(lines.join('\n'));
+    return '';
+}
+
+async function virexportCmd() {
+    const worldName = currentWorldName();
+    if (!worldName) return 'No active chat.';
+    const data = await loadWorldInfo(worldName);
+    if (!data) return 'No lorebook for current chat.';
+    const payload = { world: worldName, exportedAt: new Date().toISOString(), version: VERSION, entries: data.entries || {} };
+    const json = JSON.stringify(payload, null, 2);
+    try {
+        await navigator.clipboard.writeText(json);
+        const count = Object.keys(payload.entries).length;
+        return `Copied ${count} entr${count === 1 ? 'y' : 'ies'} to clipboard (world: ${worldName}).`;
+    } catch (err) {
+        console.log(`[${EXT}] /virexport JSON:`, json);
+        return `Clipboard unavailable; full JSON printed to browser console. Error: ${err?.message || err}`;
+    }
+}
+
+async function virimportCmd(args, value) {
+    let raw = String(value || '').trim();
+    if (!raw) {
+        try { raw = (await navigator.clipboard.readText()).trim(); } catch { /* ignore */ }
+    }
+    if (!raw) return 'Usage: /virimport <json>  (or copy JSON to clipboard then run /virimport)';
+    let parsed;
+    try { parsed = JSON.parse(raw); } catch (err) { return `JSON parse error: ${err.message}`; }
+    if (!parsed || typeof parsed !== 'object') return 'Imported value must be an object.';
+    const importedEntries = parsed.entries && typeof parsed.entries === 'object' ? parsed.entries : parsed;
+    if (typeof importedEntries !== 'object') return 'No "entries" object found in imported JSON.';
+    const worldName = currentWorldName();
+    if (!worldName) return 'No active chat.';
+    const data = await loadWorldInfo(worldName) || { entries: {} };
+    const target = getEntries(data);
+    let added = 0, updated = 0;
+    for (const imported of Object.values(importedEntries)) {
+        if (!imported || typeof imported !== 'object') continue;
+        const importedName = String(imported.comment || '').replace(/^VIR:\s*/i, '').trim();
+        if (!importedName) continue;
+        const existing = findCharacterEntry(data, importedName);
+        if (existing) {
+            Object.assign(existing, imported, { uid: existing.uid });   // keep existing UID
+            updated++;
+        } else {
+            const uid = nextUid(data);
+            target[uid] = { ...imported, uid };
+            added++;
+        }
+    }
+    await saveWorldInfo(worldName, data);
+    return `Imported into ${worldName}: ${added} new, ${updated} updated.`;
+}
+
+async function virarchiveCmd(args, value) {
+    const name = String(value || '').trim();
+    if (!name) return 'Usage: /virarchive <Name>';
+    const worldName = currentWorldName();
+    if (!worldName) return 'No active chat.';
+    const data = await loadWorldInfo(worldName);
+    const entry = data ? findCharacterEntry(data, name) : null;
+    if (!entry) return `No VIR entry to archive for "${name}".`;
+    const archive = await loadArchivesWorld();
+    const archiveEntries = getEntries(archive);
+    const canonical = characterEntryName(entry);
+    const existing = findCharacterEntry(archive, canonical);
+    if (existing) {
+        Object.assign(existing, entry, { uid: existing.uid });
+    } else {
+        const uid = nextUid(archive);
+        archiveEntries[uid] = { ...entry, uid };
+    }
+    await saveWorldInfo(ARCHIVES_WORLD, archive);
+    return `Archived "${canonical}" → ${ARCHIVES_WORLD}.`;
+}
+
+async function vircolorsCmd(args, value) {
+    const st = settings();
+    const arg = String(value || '').trim().toLowerCase();
+    if (arg === 'on') st.dialogueColorEnabled = true;
+    else if (arg === 'off') st.dialogueColorEnabled = false;
+    else st.dialogueColorEnabled = !st.dialogueColorEnabled;
+    saveSettingsDebounced();
+    if (st.dialogueColorEnabled) {
+        applyDialogueColors();
+        return 'Dialogue colours ENABLED. Each VIR character\'s .name_text is now coloured per voice_lock.dialogue_color.';
+    }
+    // Strip colours from currently-rendered messages
+    try { document.querySelectorAll('#chat .mes .name_text').forEach(n => n.style.removeProperty('color')); } catch { /* ignore */ }
+    return 'Dialogue colours DISABLED.';
+}
+
+async function virrestoreCmd(args, value) {
+    const name = String(value || '').trim();
+    if (!name) return 'Usage: /virrestore <Name>';
+    const worldName = currentWorldName();
+    if (!worldName) return 'No active chat.';
+    const archive = await loadArchivesWorld();
+    const source = findCharacterEntry(archive, name);
+    if (!source) return `No archived character matching "${name}". Use /virarchive first.`;
+    const data = await loadWorldInfo(worldName) || { entries: {} };
+    const target = getEntries(data);
+    const canonical = characterEntryName(source);
+    const existing = findCharacterEntry(data, canonical);
+    if (existing) {
+        Object.assign(existing, source, { uid: existing.uid });
+    } else {
+        const uid = nextUid(data);
+        target[uid] = { ...source, uid };
+    }
+    await saveWorldInfo(worldName, data);
+    await reapplyTiers();
+    return `Restored "${canonical}" from archive into ${worldName}.`;
+}
+
+// ============================================================================
+// v5.5 — PIC COPY anti-drift check
+// ============================================================================
+// When applyDelta merges new VIR data over an existing entry, compare stable
+// identity fields. If a stable field changed without an explicit story event,
+// log a warning. Diagnostic only — does NOT block the change.
+const ANTI_DRIFT_STABLE_FIELDS = ['species', 'age_appearance', 'height', 'hair', 'eyes', 'skin_fur_scales', 'body_material', 'non_human'];
+
+function checkVirDrift(name, oldVir, newDelta) {
+    if (!settings().enabled) return;
+    if (!oldVir || typeof oldVir !== 'object') return;
+    const changed = [];
+    for (const field of ANTI_DRIFT_STABLE_FIELDS) {
+        const oldV = String(oldVir[field] || '').trim();
+        const newV = String(newDelta?.[field] || '').trim();
+        if (newV && oldV && oldV !== newV) changed.push(`${field}: "${oldV}" → "${newV}"`);
+    }
+    if (changed.length) {
+        warn(`PIC COPY drift for "${name}":\n  ${changed.join('\n  ')}\n  Stable fields normally never change; ensure the story event justifies this.`);
+    }
+}
+
 async function registerSlashCommands() {
     try {
         const mod = await import('../../../slash-commands.js');
@@ -1922,11 +2256,38 @@ async function registerSlashCommands() {
             ];
             return lines.join('\n');
         };
+        const sheetDirective = (kind, rawName) => {
+            const name = canonicalizeName(String(rawName || '').trim()).canonical;
+            if (!name) return `Usage: /vir${kind} <Name>`;
+            const mode = settings().sheetCommandMode || settings().templateMode || 'Detailed';
+            const common = `OOC: Pause the RP for one response and run a VIR ${kind.toUpperCase()} for ${name}. End with exactly one \`\`\`vir block using schema 3 so FF4 VIR Sync can ingest it.`;
+            if (kind === 'quick') {
+                return `${common} Emit a compact visual-only update/create for ${name}: full_name, source, species, age_appearance, height, build, hair, eyes, skin_fur_scales, face_features, body, marks, outfit, accessories, pose, expression, condition, location_context. Keep values short and image-friendly.`;
+            }
+            if (kind === 'repair') {
+                return `${common} Repair missing or weak visual fields for ${name}. Prioritize full_name, full source/show/game/VN name or "original character", outfit pieces, marks, accessories, current pose/expression/condition, and PIC_COPY consistency. Do not invent a source if unknown.`;
+            }
+            if (kind === 'detail') {
+                return `${common} ENRICH every visual field for ${name} with micro-anchors so the same pic prompt renders the same way every time. For each piece of outfit/underwear/accessories: colour shade + material + item type + cut/sleeve/neckline + fit + length + closure + distinguishing detail. For hair: shade + length to a body landmark + texture + styling + parting + fringe + distinguishing detail. For eyes: shade + secondary tone + shape + size + lash + distinguishing detail. For marks: type + size + exact placement relative to an anatomical landmark + colour + healing state. For footwear: height + closure with eyelet count if laced + heel type + toe shape. Replace any field value that has fewer than 6 concrete anchors. Preserve story-established facts; do not change what colour/style something WAS, only add detail. Output a single update packet containing only the enriched fields.`;
+            }
+            return `${common} Mode: ${mode}. Create or update a full identity sheet for ${name}: stable identity, full source, body, face, marks, clothing layers, accessories, equipment, pose, expression, condition, and location context. Preserve existing stable fields unless story evidence changed them.`;
+        };
         reg('vir-recall', recall, 'Recall a character for N turns. Usage: /vir-recall <Name>');
         reg('vir-pin',    pin,    'Pin a character to Tier A (always active). Usage: /vir-pin <Name>');
         reg('vir-park',   park,   'Unpin/clear recall. Usage: /vir-park <Name>');
         reg('vir-list',   list,   'List all VIR characters with their tier.');
         reg('vir-status', status, 'Show FF4 VIR extension status.');
+        reg('virsheet', async (args, value) => sheetDirective('sheet', value), 'Ask AI for a full VIR identity sheet. Usage: /virsheet <Name>');
+        reg('virquick', async (args, value) => sheetDirective('quick', value), 'Ask AI for a compact visual VIR sheet. Usage: /virquick <Name>');
+        reg('virrepair', async (args, value) => sheetDirective('repair', value), 'Ask AI to repair weak/missing VIR fields. Usage: /virrepair <Name>');
+        reg('virdetail', async (args, value) => sheetDirective('detail', value), 'Ask AI to enrich every VIR field with micro-anchors (6-10 per field) to lock pic-to-pic consistency. Usage: /virdetail <Name>');
+        // v5.5 — virshow / virexport / virimport / virarchive / virrestore
+        reg('virshow',    virshowCmd,    'Show stored VIR + PIC COPY for a character. Usage: /virshow <Name>');
+        reg('virexport',  virexportCmd,  'Copy current chat\'s VIR world to clipboard as JSON. Usage: /virexport');
+        reg('virimport',  virimportCmd,  'Import JSON into current chat\'s VIR world. Usage: /virimport <json>  (or paste then /virimport)');
+        reg('virarchive', virarchiveCmd, 'Copy a VIR entry to the global archive world. Usage: /virarchive <Name>');
+        reg('virrestore', virrestoreCmd, 'Restore a character from the archive into this chat. Usage: /virrestore <Name>');
+        reg('vircolors',  vircolorsCmd, 'Toggle dialogue colour CSS. Usage: /vircolors  (or  /vircolors on / off)');
         log('Slash commands registered');
     } catch (e) {
         warn('Slash command registration failed', e);
@@ -1958,6 +2319,106 @@ function escapeHtml(str) {
 }
 function $(id) { return document.getElementById(id); }
 
+async function buildDiagnosticsSnapshot() {
+    const worldName = currentWorldName();
+    const st = settings();
+    const snapshot = {
+        version: VERSION,
+        chatId: getCurrentChatId?.() || '',
+        worldName,
+        enabled: !!st.enabled,
+        contractInjection: st.contractInjection !== false,
+        templateMode: st.templateMode || 'Detailed',
+        depths: { contract: VIR_CONTRACT_DEPTH, state: VIR_STATE_DEPTH, priority: VIR_PRIORITY_DEPTH },
+        missStreak: st.consecutiveMisses || 0,
+        totalMisses: st.totalMisses || 0,
+        sessionPackets: sessionPacketCount,
+        lastSyncStatus: st.lastSyncStatus || 'No sync yet',
+        recentWarnings: st.recentWarnings || [],
+        tokenEstimate: 0,
+        characters: [],
+    };
+    if (!worldName) return snapshot;
+    try {
+        const data = await loadWorldInfo(worldName);
+        if (!data) return snapshot;
+        const pinned = new Set(st.pinnedCharacters?.[worldName] || []);
+        const recall = st.recallCharacters?.[worldName] || {};
+        let totalChars = 0;
+        for (const [, entry] of characterEntries(data)) {
+            const name = characterEntryName(entry);
+            if (!name) continue;
+            const constant = entry.constant !== false && !entry.disable;
+            if (constant) totalChars += String(entry.content || '').length;
+            const reason = pinned.has(name) ? 'pinned'
+                : recall[name] ? `recall ${recall[name]} turns`
+                : constant ? 'active/constant'
+                : 'offscreen keyword-only';
+            snapshot.characters.push({
+                name,
+                tier: pinned.has(name) ? 'PIN' : recall[name] ? 'RCL' : constant ? 'ACT' : 'OFF',
+                reason,
+                order: entry.order,
+                depth: entry.depth,
+                constant,
+                disabled: !!entry.disable,
+            });
+        }
+        snapshot.tokenEstimate = Math.round(totalChars / 3.8);
+    } catch (e) {
+        snapshot.recentWarnings = [`Diagnostics failed: ${e.message}`, ...snapshot.recentWarnings].slice(0, MAX_RECENT_WARNINGS);
+    }
+    return snapshot;
+}
+
+async function copyVirDebugReport() {
+    const report = await buildDiagnosticsSnapshot();
+    const text = JSON.stringify(report, null, 2);
+    try {
+        await navigator.clipboard.writeText(text);
+        toastr.success('VIR debug report copied.', 'FF4 VIR');
+    } catch {
+        console.log(`[${EXT}] debug report`, report);
+        toastr.warning('Clipboard unavailable; report printed to console.', 'FF4 VIR');
+    }
+}
+
+window.ff4VirGetPicCopies = async function ff4VirGetPicCopies(names = []) {
+    const worldName = currentWorldName();
+    if (!worldName) return {};
+    const wanted = new Set((Array.isArray(names) ? names : String(names || '').split(','))
+        .map(n => canonicalizeName(String(n || '').trim()).canonical.toLowerCase())
+        .filter(Boolean));
+    try {
+        const data = await loadWorldInfo(worldName);
+        if (!data) return {};
+        const st = settings();
+        const pinned = new Set(st.pinnedCharacters?.[worldName] || []);
+        const recall = st.recallCharacters?.[worldName] || {};
+        const out = {};
+        for (const [, entry] of characterEntries(data)) {
+            const name = characterEntryName(entry);
+            if (!name) continue;
+            if (wanted.size && !wanted.has(name.toLowerCase())) continue;
+            const vir = parseActiveVir(entry.content || '');
+            const constant = entry.constant !== false && !entry.disable;
+            const tier = pinned.has(name) ? 'PIN' : recall[name] ? 'RCL' : constant ? 'ACT' : 'OFF';
+            out[name] = {
+                name,
+                tier,
+                constant,
+                pic_identity: buildPicIdentity(name, vir) || name,
+                pic_copy: buildPicParagraph(name, vir) || extractPicCopy(entry.content || ''),
+                source: canonicalSourceName(vir),
+            };
+        }
+        return out;
+    } catch (e) {
+        warn('ff4VirGetPicCopies failed', e);
+        return {};
+    }
+};
+
 function renderSettings() {
     if ($('ff4_vir_settings')) return;
     $('extensions_settings')?.insertAdjacentHTML('beforeend', `
@@ -1977,8 +2438,19 @@ function renderSettings() {
 
                     <label class="ff4-vir-tog" title="Auto-create a pinned VIR entry from your active persona description so {{user}} is tracked alongside NPCs. The AI never emits a vir packet for the user — this bridges that gap."><input id="ff4_vir_seed_user" type="checkbox"> <span>Track user persona ({{user}})</span></label>
 
+                    <div class="ff4-vir-mode-row">
+                        <label for="ff4_vir_template_mode"><b>Template mode</b></label>
+                        <select id="ff4_vir_template_mode" class="text_pole widthNatural">
+                            <option value="Compact">Compact</option>
+                            <option value="Detailed">Detailed</option>
+                            <option value="VN Director">VN Director</option>
+                            <option value="Image Heavy">Image Heavy</option>
+                        </select>
+                    </div>
+
                     <details class="ff4-vir-advanced">
                         <summary>Advanced</summary>
+                        <label class="ff4-vir-tog" title="Show injection diagnostics and copyable debug reports."><input id="ff4_vir_diagnostics" type="checkbox"> <span>Diagnostics panel</span></label>
                         <label class="ff4-vir-tog" title="Store the VIR lorebook reference in chat metadata so it re-activates automatically when you reopen this chat."><input id="ff4_vir_bind_to_chat" type="checkbox"> <span>Bind lorebook to current chat</span></label>
                         <label class="ff4-vir-tog" title="When a chat is deleted, also delete its VIR lorebook so orphaned lorebooks don't pile up."><input id="ff4_vir_cleanup_delete" type="checkbox"> <span>Delete VIR lorebook when chat deleted</span></label>
                         <label class="ff4-vir-tog" title="Verbose console logging + toasts for troubleshooting."><input id="ff4_vir_debug" type="checkbox"> <span>Debug logging</span></label>
@@ -2001,9 +2473,15 @@ function renderSettings() {
                         <div id="ff4_vir_warnings"></div>
                     </details>
 
+                    <details class="ff4-vir-diagnostics">
+                        <summary>Diagnostics</summary>
+                        <div id="ff4_vir_diagnostics_body" class="ff4-vir-muted">Loading...</div>
+                    </details>
+
                     <div class="ff4-vir-buttons">
                         <button id="ff4_vir_activate" class="menu_button" title="Force re-activate VIR lorebook in ST's Active Worlds list">⚓ Activate</button>
                         <button id="ff4_vir_refresh" class="menu_button">⟳ Refresh</button>
+                        <button id="ff4_vir_copy_debug" class="menu_button">Copy Debug</button>
                         <button id="ff4_vir_clear_warn" class="menu_button">Clear</button>
                         <button id="ff4_vir_export" class="menu_button">⬇ Export</button>
                         <label for="ff4_vir_import" class="menu_button">⬆ Import</label>
@@ -2033,7 +2511,18 @@ function renderSettings() {
         if (settings().contractInjection) injectVirContract();
         else clearVirContract();
     });
+    const templateModeEl = $('ff4_vir_template_mode');
+    if (templateModeEl) {
+        templateModeEl.value = settings().templateMode || 'Detailed';
+        templateModeEl.addEventListener('change', function () {
+            settings().templateMode = this.value;
+            saveSettingsDebounced();
+            if (settings().contractInjection) injectVirContract();
+            updateStatus();
+        });
+    }
     wire('ff4_vir_seed_user', 'seedUserPersona', async () => { if (settings().seedUserPersona) await activateCurrentWorld(); });
+    wire('ff4_vir_diagnostics', 'diagnosticsEnabled', updateStatus);
     wire('ff4_vir_bind_to_chat', 'bindToChat', async () => { if (settings().bindToChat) await activateCurrentWorld(); });
     wire('ff4_vir_cleanup_delete', 'cleanupOnChatDelete');
     wire('ff4_vir_debug', 'debug');
@@ -2044,6 +2533,7 @@ function renderSettings() {
         renderCharacterList();
     });
     $('ff4_vir_refresh')?.addEventListener('click', () => { updateStatus(); renderCharacterList(); });
+    $('ff4_vir_copy_debug')?.addEventListener('click', copyVirDebugReport);
     $('ff4_vir_clear_warn')?.addEventListener('click', () => {
         settings().recentWarnings = [];
         saveSettingsDebounced();
@@ -2099,6 +2589,23 @@ async function updateStatus() {
         warnEl.innerHTML = ws.length
             ? ws.slice(0, 5).map(w => `<div class="ff4-vir-warning">${escapeHtml(w)}</div>`).join('')
             : '<div class="ff4-vir-muted">No recent warnings.</div>';
+    }
+
+    const diagEl = $('ff4_vir_diagnostics_body');
+    if (diagEl) {
+        if (!settings().diagnosticsEnabled) {
+            diagEl.innerHTML = '<div class="ff4-vir-muted">Diagnostics disabled.</div>';
+        } else {
+            const snap = await buildDiagnosticsSnapshot();
+            const rows = snap.characters.slice(0, 12).map(c =>
+                `<div><b>[${escapeHtml(c.tier)}]</b> ${escapeHtml(c.name)} — ${escapeHtml(c.reason)} · depth ${escapeHtml(c.depth ?? '--')} · order ${escapeHtml(c.order ?? '--')}</div>`
+            ).join('') || '<div>No character entries yet.</div>';
+            diagEl.innerHTML = `
+                <div><b>Mode:</b> ${escapeHtml(snap.templateMode)} · <b>Depths:</b> contract ${VIR_CONTRACT_DEPTH}, state ${VIR_STATE_DEPTH}, priority ${VIR_PRIORITY_DEPTH}</div>
+                <div><b>Misses:</b> streak ${escapeHtml(snap.missStreak)}, total ${escapeHtml(snap.totalMisses)} · <b>Tokens:</b> ${escapeHtml(snap.tokenEstimate)}</div>
+                <div><b>Last injection:</b><pre style="white-space:pre-wrap;max-height:120px;overflow:auto;">${escapeHtml(settings().lastInjectionPreview || 'No injection preview yet.')}</pre></div>
+                <div>${rows}</div>`;
+        }
     }
 
     await renderCharacterList();
@@ -2226,9 +2733,59 @@ jQuery(async () => {
 
     // ── CHARACTER_MESSAGE_RENDERED — DOM-only strip after full render ──
     // Catches any VIR content that survived into the final rendered HTML.
-    eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, handleMessageRendered);
+    eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, async (mesId) => {
+        await handleMessageRendered(mesId);
+        if (settings().dialogueColorEnabled) applyDialogueColors();
+    });
+
+    // Re-apply colours on chat switch
+    eventSource.on(event_types.CHAT_CHANGED, () => {
+        if (settings().dialogueColorEnabled) setTimeout(applyDialogueColors, 200);
+    });
 
     registerSlashCommands();
     await activateCurrentWorld();
     log(`v${VERSION} initialized (RPG-HUD-aligned event model)`);
 });
+
+// ── v5.5 dialogue colour CSS application ────────────────────────────────────
+// Reads voice_lock.dialogue_color for each character in the current chat's VIR
+// world and applies the colour to that character's .name_text label in chat DOM.
+// Pure DOM styling — no markdown injection, no message mutation.
+async function getDialogueColorMap() {
+    const worldName = currentWorldName();
+    if (!worldName) return new Map();
+    const data = await loadWorldInfo(worldName).catch(() => null);
+    if (!data) return new Map();
+    const map = new Map();
+    for (const [, entry] of characterEntries(data)) {
+        const name = characterEntryName(entry);
+        const vir = parseActiveVir(entry.content || '');
+        const color = String(vir?.voice_lock?.dialogue_color || '').trim();
+        if (name && /^#[0-9a-f]{3,8}$/i.test(color)) {
+            map.set(name.toLowerCase(), color);
+        }
+    }
+    return map;
+}
+
+async function applyDialogueColors() {
+    try {
+        const map = await getDialogueColorMap();
+        if (!map.size) return;
+        document.querySelectorAll('#chat .mes .name_text').forEach(node => {
+            const label = String(node.textContent || '').trim().toLowerCase();
+            if (!label) return;
+            // Match exact, or first-word match (handles "Belne the Bold")
+            let color = map.get(label);
+            if (!color) {
+                const first = label.split(/\s+/)[0];
+                if (first) color = map.get(first);
+            }
+            if (color) node.style.color = color;
+            else node.style.removeProperty('color');
+        });
+    } catch (err) {
+        warn('applyDialogueColors failed', err?.message);
+    }
+}
