@@ -123,7 +123,7 @@ const VIR_TEMPLATE_MODES = {
         label: 'Detailed',
         summary: 'Balanced default. Full visual identity when needed, but not bloated.',
         rules: [
-            'On create or repair: emit full visual identity detail with enough specificity for consistent PIC COPY.',
+            'On create or repair: emit full visual identity detail with enough specificity for consistent image prompting.',
             'Preserve stable identity exactly after creation unless the story explicitly changes it.',
             'On update: focus on changed outfit, pose, expression, condition, exposure, accessories, and location_context.',
             'Keep values concrete and image-friendly without repeating the whole sheet every turn.',
@@ -143,14 +143,14 @@ const VIR_TEMPLATE_MODES = {
     },
     'Image Heavy': {
         label: 'Image Heavy',
-        summary: 'Image-consistency-first mode. Strongest PIC COPY anchors.',
+        summary: 'Image-consistency-first mode. Strongest visual anchors.',
         rules: [
             'Prioritize image consistency above brevity.',
             'On create or repair: make every visible image-relevant field renderable on its own.',
             'Stable anchors must be complete and explicit: full_name, source, species, age_appearance, height, build, body_material, hair, eyes, skin/fur/scales, face_features, body, marks, non_human.',
             'Current visual anchors must stay exact: outfit pieces and layers, underwear state, accessories, equipment, exposure, pose, expression, condition, and location_context.',
             'Sexual or intense context never implies undressing or exposure changes unless the story explicitly changed them.',
-            'If a PIC COPY field is vague, repair it into plain concrete visual language.',
+            'If a visual field is vague, repair it into plain concrete visual language.',
         ],
     },
 };
@@ -671,16 +671,20 @@ function lockedVisualCard(name, vir = {}) {
 
 function characterContent(name, payload = {}) {
     const vir = payload.vir || payload;
-    const picPara = buildPicParagraph(name, vir);
     const picIdentity = buildPicIdentity(name, vir);
     return `[ACTIVE VIR: ${name}]
-When writing a <pic> that includes ${name}, copy the [PIC COPY] paragraph below verbatim — do not paraphrase, shorten, or invent. Adjust only pose/expression/condition to match the current visual beat.
 Canonical name+source for image prompts: ${picIdentity || name}
-[PIC COPY: ${name}]
-${picPara}
-[/PIC COPY]
 ${lockedVisualCard(name, vir)}
 [/ACTIVE VIR]`;
+}
+
+function normalizeLegacyPicCopy(entry) {
+    if (!entry?.content || !/\[PIC COPY:/i.test(String(entry.content))) return false;
+    const name = characterEntryName(entry);
+    if (!name) return false;
+    const vir = parseActiveVir(entry.content || '');
+    entry.content = characterContent(name, { vir });
+    return true;
 }
 
 function parseActiveVir(content) {
@@ -990,6 +994,7 @@ function setActiveFlags(data, activeNames, pinnedNames = new Set(), recallNames 
         if (!entry || entry.comment === 'FF4 VIR Rules' || entry.comment === 'FF4 FF4_STATE' || entry.comment === 'FF4 VIR Roster') continue;
         const name = characterEntryName(entry);
         if (!name) continue;
+        normalizeLegacyPicCopy(entry);
         enforceVirRecursionFlags(entry);
         if (pinnedNames.has(name)) {
             entry.constant = true; entry.order = TIER.PINNED.order; entry.depth = TIER.PINNED.depth;
@@ -1640,7 +1645,7 @@ async function buildVirStateText() {
         lines.push(`Character block order for <pic> prompts: ${promptLockNames.join(' -> ')}`);
         lines.push('Do not reshuffle this order on retries unless the prose explicitly gives a new left/right layout.');
         lines.push('Use physical positions from position/location/pose first: behind counter, in front of counter, doorway, background, beside bed. Do not invent left/right when a better physical slot exists.');
-        lines.push('Copy each PIC_COPY line as the visual identity source; keep the canonical "Full Name from Full Source Name" or "Full Name, an original character" wording intact. Only pose, expression, and condition may change when the current beat changes.');
+        lines.push('Use the ACTIVE VIR fields as the visual identity source; keep the canonical "Full Name from Full Source Name" or "Full Name, an original character" wording intact. Only pose, expression, and condition may change when the current beat changes.');
         lines.push('[/VIR PROMPT LOCK]');
     }
 
@@ -1649,11 +1654,9 @@ async function buildVirStateText() {
         const name = characterEntryName(entry);
         if (!name) continue;
         const vir = parseActiveVir(entry.content || '');
-        const picCopy = buildPicParagraph(name, vir) || extractPicCopy(entry.content || '');
         const card = [
             `  ${name}:`,
             `    pic_identity: ${buildPicIdentity(name, vir) || name}`,
-            picCopy ? `    pic_copy: ${picCopy}` : '',
             vir.species ? `    species: ${vir.species}` : '',
             vir.source ? `    source: ${vir.source}` : '',
             vir.age_appearance ? `    age: ${vir.age_appearance}` : '',
@@ -2039,7 +2042,6 @@ async function virshowCmd(args, value) {
     const entry = data ? findCharacterEntry(data, name) : null;
     if (!entry) return `No VIR entry found for "${name}". Try /vir-list to see active names.`;
     const vir = parseActiveVir(entry.content || '');
-    const picCopy = extractPicCopy(entry.content || '');
     const lines = [`**VIR entry — ${characterEntryName(entry)}**`];
     const printable = (k, v) => v ? lines.push(`- ${k}: ${Array.isArray(v) ? v.join('; ') : v}`) : null;
     printable('full_name', vir.full_name);
@@ -2066,7 +2068,6 @@ async function virshowCmd(args, value) {
     printable('condition', vir.condition);
     printable('location_context', vir.location_context);
     if (vir.voice_lock?.dialogue_color) lines.push(`- dialogue_color: ${vir.voice_lock.dialogue_color}`);
-    if (picCopy) lines.push('', '**PIC COPY:**', picCopy);
     printToChat(lines.join('\n'));
     return '';
 }
@@ -2184,7 +2185,7 @@ async function virrestoreCmd(args, value) {
 }
 
 // ============================================================================
-// v5.5 — PIC COPY anti-drift check
+// v5.5 — image-anchor anti-drift check
 // ============================================================================
 // When applyDelta merges new VIR data over an existing entry, compare stable
 // identity fields. If a stable field changed without an explicit story event,
@@ -2201,18 +2202,31 @@ function checkVirDrift(name, oldVir, newDelta) {
         if (newV && oldV && oldV !== newV) changed.push(`${field}: "${oldV}" → "${newV}"`);
     }
     if (changed.length) {
-        warn(`PIC COPY drift for "${name}":\n  ${changed.join('\n  ')}\n  Stable fields normally never change; ensure the story event justifies this.`);
+        warn(`Image-anchor drift for "${name}":\n  ${changed.join('\n  ')}\n  Stable fields normally never change; ensure the story event justifies this.`);
     }
 }
 
 async function registerSlashCommands() {
     try {
         const mod = await import('../../../slash-commands.js');
+        const slashCmdMod = await import('../../../slash-commands/SlashCommand.js');
         const parser = mod.SlashCommandParser?.commands ? mod.SlashCommandParser : null;
+        const SlashCommand = slashCmdMod.SlashCommand;
         if (!parser) return;
         const reg = (name, callback, helpText) => {
             try {
-                parser.addCommandObject?.({ name, callback, helpString: helpText });
+                if (parser.addCommandObject && SlashCommand?.fromProps) {
+                    parser.addCommandObject(SlashCommand.fromProps({
+                        name,
+                        callback,
+                        helpString: helpText,
+                    }));
+                    return;
+                }
+                if (parser.addCommand) {
+                    parser.addCommand(name, callback, [], helpText);
+                    return;
+                }
             } catch {
                 if (typeof window.registerSlashCommand === 'function') {
                     window.registerSlashCommand(name, callback, [], helpText, true, true);
@@ -2323,7 +2337,7 @@ async function registerSlashCommands() {
         reg('virrepair', async (args, value) => sheetDirective('repair', value), 'Ask AI to repair weak/missing VIR fields. Usage: /virrepair <Name>');
         reg('virdetail', async (args, value) => sheetDirective('detail', value), 'Ask AI to enrich every VIR field with micro-anchors (6-10 per field) to lock pic-to-pic consistency. Usage: /virdetail <Name>');
         // v5.5 — virshow / virexport / virimport / virarchive / virrestore
-        reg('virshow',    virshowCmd,    'Show stored VIR + PIC COPY for a character. Usage: /virshow <Name>');
+        reg('virshow',    virshowCmd,    'Show stored VIR fields for a character. Usage: /virshow <Name>');
         reg('virexport',  virexportCmd,  'Copy current chat\'s VIR world to clipboard as JSON. Usage: /virexport');
         reg('virimport',  virimportCmd,  'Import JSON into current chat\'s VIR world. Usage: /virimport <json>  (or paste then /virimport)');
         reg('virarchive', virarchiveCmd, 'Copy a VIR entry to the global archive world. Usage: /virarchive <Name>');
