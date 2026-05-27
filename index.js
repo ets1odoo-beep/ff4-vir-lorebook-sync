@@ -110,21 +110,63 @@ let sessionPacketCount = 0;
 const VIR_TEMPLATE_MODES = {
     Compact: {
         label: 'Compact',
-        note: 'Keep VIR packets short. Update only fields that visibly changed. Prefer concise PIC_COPY-compatible values.',
+        summary: 'Low-token mode. Keep VIR packets short and practical.',
+        rules: [
+            'Use the minimum fields needed to keep continuity stable.',
+            'On create: emit the stable visual identity core plus current outfit, pose, expression, condition, and location_context.',
+            'On update: emit only fields that visibly changed this turn. Do not restate stable identity unless it was missing or wrong.',
+            'Prefer short image-friendly values over long descriptive chains.',
+            'Omit optional flourish, interpretation, and redundant synonyms.',
+        ],
     },
     Detailed: {
         label: 'Detailed',
-        note: 'Use full visual identity detail when creating or repairing characters. Preserve stable fields exactly after creation.',
+        summary: 'Balanced default. Full visual identity when needed, but not bloated.',
+        rules: [
+            'On create or repair: emit full visual identity detail with enough specificity for consistent PIC COPY.',
+            'Preserve stable identity exactly after creation unless the story explicitly changes it.',
+            'On update: focus on changed outfit, pose, expression, condition, exposure, accessories, and location_context.',
+            'Keep values concrete and image-friendly without repeating the whole sheet every turn.',
+            'If a field is weak for image use, repair it once and then keep it stable.',
+        ],
     },
     'VN Director': {
         label: 'VN Director',
-        note: 'Track visual state like a VN continuity bible: scene position, expression, outfit, condition, and active cast must stay current.',
+        summary: 'Continuity-first mode. Prioritize scene blocking and active cast staging.',
+        rules: [
+            'Treat VIR like a VN continuity bible, not a character encyclopedia.',
+            'Prioritize scene.active, location, location_context, position, pose, expression, condition, who is on-screen, and who is off-screen.',
+            'Track entrances, exits, viewpoint changes, seating/standing positions, who faces whom, and visible distance/placement shifts.',
+            'Keep outfit and exposure current, but do not over-expand stable anatomy unless needed for continuity repair.',
+            'When only staging changes, update staging cleanly instead of rewriting identity.',
+        ],
     },
     'Image Heavy': {
         label: 'Image Heavy',
-        note: 'Prioritize image consistency: full_name, source, hair, face, marks, outfit pieces, accessories, pose, expression, and condition must be complete.',
+        summary: 'Image-consistency-first mode. Strongest PIC COPY anchors.',
+        rules: [
+            'Prioritize image consistency above brevity.',
+            'On create or repair: make every visible image-relevant field renderable on its own.',
+            'Stable anchors must be complete and explicit: full_name, source, species, age_appearance, height, build, body_material, hair, eyes, skin/fur/scales, face_features, body, marks, non_human.',
+            'Current visual anchors must stay exact: outfit pieces and layers, underwear state, accessories, equipment, exposure, pose, expression, condition, and location_context.',
+            'Sexual or intense context never implies undressing or exposure changes unless the story explicitly changed them.',
+            'If a PIC COPY field is vague, repair it into plain concrete visual language.',
+        ],
     },
 };
+
+function buildTemplateModeBlock(mode) {
+    const rules = Array.isArray(mode?.rules) ? mode.rules : [];
+    return [
+        `[VIR TEMPLATE MODE: ${mode?.label || 'Detailed'}]`,
+        mode?.summary || '',
+        '',
+        '[MODE RULES]',
+        ...rules.map(rule => `- ${rule}`),
+        '[/MODE RULES]',
+        '[/VIR TEMPLATE MODE]',
+    ].filter(Boolean).join('\n');
+}
 
 // ============================================================================
 // THE VIR CONTRACT — auto-injected as system prompt every generation
@@ -1534,9 +1576,7 @@ function injectVirContract() {
         const mode = VIR_TEMPLATE_MODES[settings().templateMode] || VIR_TEMPLATE_MODES.Detailed;
         const contract = `${VIR_CONTRACT}
 
-[VIR TEMPLATE MODE: ${mode.label}]
-${mode.note}
-[/VIR TEMPLATE MODE]`;
+${buildTemplateModeBlock(mode)}`;
         // Main contract at depth 4 (full reference).
         setExtensionPrompt('FF4_VIR_CONTRACT', contract, POSITION_IN_CHAT, VIR_CONTRACT_DEPTH, false, 'system');
         // Priority reminder at depth 1 — fresh attention anchor. Escalates if AI keeps missing.
