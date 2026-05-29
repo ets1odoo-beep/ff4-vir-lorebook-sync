@@ -1,4 +1,4 @@
-// FF4 VIR Lorebook Sync — v6.0.0 (lorebook-only injection, 3 templates with token caps)
+// FF4 VIR Lorebook Sync — v6.2.0 (per-chat template override + per-chat disable)
 // v6 changes:
 //   - SillyTavern owns ALL injection. The extension only writes lorebook entries
 //     with tier flags (constant/order/depth/key[]); ST decides what gets injected
@@ -42,8 +42,9 @@ import {
 // CONSTANTS
 // ============================================================================
 const EXT = 'ff4-vir-lorebook-sync';
-const VERSION = '6.1.0';
+const VERSION = '6.2.0';
 const WORLD_PREFIX = 'FF4 VIR - ';
+const CHAT_OVERRIDE_KEY = 'ff4VirOverrides';
 
 // Tier system — re-applied every sync based on scene_state
 // Tier A: pinned mains (always inject)
@@ -381,6 +382,43 @@ function settings() {
 function log(...args)   { if (settings().debug) console.log(`[${EXT}]`, ...args); }
 function warn(...args)  { console.warn(`[${EXT}]`, ...args); }
 function error(...args) { console.error(`[${EXT}]`, ...args); }
+
+function getChatOverrides() {
+    const raw = chat_metadata?.[CHAT_OVERRIDE_KEY];
+    const template = resolveTemplateMode(raw?.templateMode).label;
+    const hasTemplateOverride = typeof raw?.templateMode === 'string' && !!String(raw.templateMode).trim();
+    return {
+        disabled: raw?.disabled === true,
+        templateMode: hasTemplateOverride ? template : '',
+    };
+}
+
+function getEffectiveTemplate() {
+    return getChatOverrides().templateMode || settings().templateMode || 'Detailed';
+}
+
+function isVirDisabledForChat() {
+    return settings().enabled !== true ? true : getChatOverrides().disabled === true;
+}
+
+async function setChatOverrides(nextOverrides) {
+    if (typeof chat_metadata !== 'object' || !chat_metadata) return false;
+    const normalized = {
+        disabled: nextOverrides?.disabled === true,
+        templateMode: nextOverrides?.templateMode ? resolveTemplateMode(nextOverrides.templateMode).label : '',
+    };
+    if (!normalized.disabled && !normalized.templateMode) {
+        delete chat_metadata[CHAT_OVERRIDE_KEY];
+    } else {
+        chat_metadata[CHAT_OVERRIDE_KEY] = normalized;
+    }
+    try {
+        await saveMetadata();
+    } catch (e) {
+        warn('saveMetadata failed', e);
+    }
+    return true;
+}
 
 // v6 P2-9 — single canonical surface for pinnedCharacters[worldName].
 // Internally treated as a Set (dedup, O(1) membership); persisted as an
@@ -880,7 +918,7 @@ function enforceBudget(text, maxTokens, template, vir, name) {
 
 // ── Dispatcher ─────────────────────────────────────────────────────────────
 function renderEntry(name, vir, templateName) {
-    const tplName = templateName || settings().templateMode || 'Detailed';
+    const tplName = templateName || getEffectiveTemplate();
     const mode = resolveTemplateMode(tplName);
     const label = mode.label;
     let text;
@@ -1429,7 +1467,7 @@ function ensureSchemaEntry(data) {
     // and processSyncPacket so it stays in sync with template-mode changes.
     const entries = getEntries(data);
     let entry = Object.values(entries).find(e => e?.comment === RULES_ENTRY_COMMENT);
-    const mode = resolveTemplateMode(settings().templateMode);
+    const mode = resolveTemplateMode(getEffectiveTemplate());
     const content = `${VIR_CONTRACT}\n\n${buildVirBudgetBlock()}\n\n${buildTemplateModeBlock(mode)}`;
     if (!entry) {
         const uid = nextUid(data);
@@ -1848,9 +1886,16 @@ async function ensureWorldLoaded(worldName) {
     return data;
 }
 async function activateCurrentWorld() {
-    if (!settings().enabled) return;
     const worldName = currentWorldName();
     if (!worldName) return;
+    if (isVirDisabledForChat()) {
+        const wiSettings = getWorldInfoSettings();
+        const active = Array.isArray(selected_world_info) ? selected_world_info : [];
+        updateWorldInfoSettings(wiSettings, active.filter(n => n !== worldName));
+        clearVirContract();
+        updateStatus();
+        return;
+    }
     const data = await ensureWorldLoaded(worldName);
     rememberWorldChat(worldName);
     // Phase 1 — seed the user persona VIR so {{user}} is tracked too.
@@ -1949,12 +1994,12 @@ A reply that omits \`\`\`vir entirely is MALFORMED and will be rejected.
 // future-proofs the call sites and makes priority escalation deterministic
 // before the next generation fires.
 async function injectVirContract() {
-    if (!settings().enabled || !settings().contractInjection) return;
+    if (isVirDisabledForChat() || !settings().contractInjection) return;
     try {
         const ctx = getContext();
         const setExtensionPrompt = ctx?.setExtensionPrompt || window.setExtensionPrompt;
         if (typeof setExtensionPrompt !== 'function') return;
-        const mode = resolveTemplateMode(settings().templateMode);
+        const mode = resolveTemplateMode(getEffectiveTemplate());
         const contract = `${VIR_CONTRACT}
 
 ${buildVirBudgetBlock()}
@@ -2008,6 +2053,7 @@ function clearVirContract() {
 // PROCESS SYNC PACKET — apply state to lorebook
 // ============================================================================
 async function processSyncPacket(sync) {
+    if (isVirDisabledForChat()) return { upserted: [], warnings: [] };
     const worldName = currentWorldName();
     if (!worldName) throw new Error('No active chat id');
     const data = await ensureWorldLoaded(worldName);
@@ -2182,7 +2228,7 @@ async function processMessageData(messageId) {
  * and saveChat() here — ComfyUI image injection happens separately.
  */
 async function handleGenerationEnded() {
-    if (!settings().enabled) return;
+    if (isVirDisabledForChat()) return;
     const context = getContext();
     if (!context.chat?.length) return;
     for (let i = context.chat.length - 1; i >= 0; i--) {
@@ -2247,7 +2293,7 @@ async function handleGenerationEnded() {
  * Never touches msg.mes — that's handled by GENERATION_ENDED.
  */
 function handleMessageReceived(mesId) {
-    if (!settings().enabled) return;
+    if (isVirDisabledForChat()) return;
     const context = getContext();
     const idx = typeof mesId === 'number' ? mesId : context.chat.length - 1;
     const msg = context.chat?.[idx];
@@ -2261,7 +2307,7 @@ function handleMessageReceived(mesId) {
  * Catches any VIR fences that survived into rendered HTML.
  */
 function handleMessageRendered(mesId) {
-    if (!settings().enabled) return;
+    if (isVirDisabledForChat()) return;
     const context = getContext();
     const idx = typeof mesId === 'number' ? mesId : context.chat.length - 1;
     const el = document.querySelector(`.mes[mesid="${idx}"] .mes_text`);
@@ -2595,21 +2641,31 @@ async function registerSlashCommands() {
         const status = async () => {
             const worldName = currentWorldName();
             const st = settings();
+            const chatOverrides = getChatOverrides();
             const lines = [
                 `FF4 VIR v${VERSION}`,
                 `Enabled: ${st.enabled}`,
+                `Disabled for this chat: ${chatOverrides.disabled}`,
                 `Smart tiers: ${st.smartTiers !== false}`,
                 `Contract injection: ${st.contractInjection !== false}`,
+                `Template: ${getEffectiveTemplate()}${chatOverrides.templateMode ? ` (chat override; global ${st.templateMode || 'Detailed'})` : ` (global ${st.templateMode || 'Detailed'})`}`,
                 `Current world: ${worldName || 'none'}`,
                 `Session packets: ${sessionPacketCount}`,
                 `Last sync: ${st.lastSyncStatus}`,
             ];
             return lines.join('\n');
         };
+        const parseTemplateScope = (rawArgs, rawValue) => {
+            const args = rawArgs || {};
+            const source = String(rawValue || '');
+            const globalFlag = args.global === true || args.global === 'true' || /\s--global\b/i.test(source) || /^--global\b/i.test(source);
+            const cleaned = source.replace(/\s--global\b/ig, '').replace(/^--global\b\s*/i, '').trim();
+            return { globalFlag, target: cleaned };
+        };
         const sheetDirective = (kind, rawName) => {
             const name = canonicalizeName(String(rawName || '').trim()).canonical;
             if (!name) return `Usage: /vir${kind} <Name>`;
-            const mode = settings().sheetCommandMode || settings().templateMode || 'Detailed';
+            const mode = settings().sheetCommandMode || getEffectiveTemplate();
             const common = `OOC: Pause the RP for one response and run a VIR ${kind.toUpperCase()} for ${name}. End with exactly one \`\`\`vir block using schema 3 so FF4 VIR Sync can ingest it.`;
             if (kind === 'quick') {
                 return `${common} Emit a compact visual-only update/create for ${name}: full_name, source, species, age_appearance, height, build, hair, eyes, skin_fur_scales, face_features, body, marks, outfit, accessories, pose, expression, condition, location_context. Keep values short and image-friendly.`;
@@ -2627,23 +2683,42 @@ async function registerSlashCommands() {
         reg('vir-park',   park,   'Unpin/clear recall. Usage: /vir-park <Name>');
         reg('vir-list',   list,   'List all VIR characters with their tier.');
         reg('vir-status', status, 'Show FF4 VIR extension status.');
-        // v6.1 — quick template switch from chat input.
-        reg('vir-template', async (_args, value) => {
-            const target = String(value || '').trim();
+        reg('vir-template', async (args, value) => {
+            const { globalFlag, target } = parseTemplateScope(args, value);
             if (!target) {
-                return `Current template: ${settings().templateMode || 'Detailed'} (per-char cap: ${resolveTemplateMode(settings().templateMode).budgetTokens} tok). Usage: /vir-template <Compact|Standard|Detailed>`;
+                const overrides = getChatOverrides();
+                const scope = overrides.templateMode ? `chat override ${overrides.templateMode}` : 'no chat override';
+                return `Current template: ${getEffectiveTemplate()} (${scope}; global ${settings().templateMode || 'Detailed'}). Usage: /vir-template <Compact|Standard|Detailed> [--global]`;
             }
             const valid = ['Compact', 'Standard', 'Detailed'];
             const match = valid.find(v => v.toLowerCase() === target.toLowerCase());
             if (!match) return `Invalid template "${target}". Choose: ${valid.join(' | ')}`;
-            settings().templateMode = match;
-            saveSettingsDebounced();
+            if (globalFlag || !getCurrentChatId()) {
+                settings().templateMode = match;
+                saveSettingsDebounced();
+            } else {
+                await setChatOverrides({ ...getChatOverrides(), templateMode: match });
+            }
             const select = document.getElementById('ff4_vir_template_mode');
-            if (select) select.value = match;
-            if (settings().contractInjection) await injectVirContract();
+            if (select && globalFlag) select.value = match;
+            await activateCurrentWorld();
             renderCharacterList();
-            return `Template switched to ${match} (≤${resolveTemplateMode(match).budgetTokens} tok/char). Existing entries keep their old shape until refreshed.`;
-        }, 'Switch the global VIR template. Usage: /vir-template <Compact|Standard|Detailed>');
+            return globalFlag || !getCurrentChatId()
+                ? `Global template switched to ${match} (<=${resolveTemplateMode(match).budgetTokens} tok/char).`
+                : `Template override for this chat set to ${match} (<=${resolveTemplateMode(match).budgetTokens} tok/char). Existing entries keep their old shape until refreshed.`;
+        }, 'Switch VIR template for this chat, or use --global for the global default. Usage: /vir-template <Compact|Standard|Detailed> [--global]');
+        reg('vir-disable', async () => {
+            if (!getCurrentChatId()) return 'No active chat.';
+            await setChatOverrides({ ...getChatOverrides(), disabled: true });
+            await activateCurrentWorld();
+            return 'FF4 VIR disabled for this chat.';
+        }, 'Disable FF4 VIR for the current chat.');
+        reg('vir-enable', async () => {
+            if (!getCurrentChatId()) return 'No active chat.';
+            await setChatOverrides({ ...getChatOverrides(), disabled: false });
+            await activateCurrentWorld();
+            return 'FF4 VIR enabled for this chat.';
+        }, 'Enable FF4 VIR for the current chat.');
         reg('virsheet', async (args, value) => sheetDirective('sheet', value), 'Ask AI for a full VIR identity sheet. Usage: /virsheet <Name>');
         reg('virquick', async (args, value) => sheetDirective('quick', value), 'Ask AI for a compact visual VIR sheet. Usage: /virquick <Name>');
         reg('virrepair', async (args, value) => sheetDirective('repair', value), 'Ask AI to repair weak/missing VIR fields. Usage: /virrepair <Name>');
@@ -2691,13 +2766,16 @@ function $(id) { return document.getElementById(id); }
 async function buildDiagnosticsSnapshot() {
     const worldName = currentWorldName();
     const st = settings();
+    const chatOverrides = getChatOverrides();
     const snapshot = {
         version: VERSION,
         chatId: getCurrentChatId?.() || '',
         worldName,
         enabled: !!st.enabled,
+        chatDisabled: chatOverrides.disabled,
+        chatTemplateOverride: chatOverrides.templateMode || '',
         contractInjection: st.contractInjection !== false,
-        templateMode: st.templateMode || 'Detailed',
+        templateMode: getEffectiveTemplate(),
         depths: { contract: VIR_CONTRACT_DEPTH, state: VIR_STATE_DEPTH, priority: VIR_PRIORITY_DEPTH },
         missStreak: st.consecutiveMisses || 0,
         totalMisses: st.totalMisses || 0,
@@ -2818,6 +2896,21 @@ function renderSettings() {
                     </div>
 
                     <details class="ff4-vir-advanced">
+                        <summary>Per-chat overrides</summary>
+                        <label class="ff4-vir-tog" title="Disable FF4 VIR for only this chat. The lorebook stays on disk; parsing, activation, and contract injection are skipped until you re-enable it."><input id="ff4_vir_chat_disabled" type="checkbox"> <span>Disable FF4 VIR in this chat</span></label>
+                        <div class="ff4-vir-mode-row">
+                            <label for="ff4_vir_chat_template_mode"><b>Chat template override</b></label>
+                            <select id="ff4_vir_chat_template_mode" class="text_pole widthNatural">
+                                <option value="">Use global template</option>
+                                <option value="Compact">Compact (<=128 tok)</option>
+                                <option value="Standard">Standard (<=192 tok)</option>
+                                <option value="Detailed">Detailed (<=256 tok)</option>
+                            </select>
+                            <span id="ff4_vir_chat_template_hint" class="ff4-vir-muted ff4-vir-mode-hint">Uses the global template by default.</span>
+                        </div>
+                    </details>
+
+                    <details class="ff4-vir-advanced">
                         <summary>Advanced</summary>
                         <label class="ff4-vir-tog" title="Show injection diagnostics and copyable debug reports."><input id="ff4_vir_diagnostics" type="checkbox"> <span>Diagnostics panel</span></label>
                         <label class="ff4-vir-tog" title="Store the VIR lorebook reference in chat metadata so it re-activates automatically when you reopen this chat."><input id="ff4_vir_bind_to_chat" type="checkbox"> <span>Bind lorebook to current chat</span></label>
@@ -2886,8 +2979,8 @@ function renderSettings() {
         });
     };
     wire('ff4_vir_enabled', 'enabled', async () => {
-        if (settings().enabled) await activateCurrentWorld();
-        else clearVirContract();
+        await activateCurrentWorld();
+        if (!settings().enabled) clearVirContract();
     });
     wire('ff4_vir_auto_hide', 'autoHideSyncedPackets');
     wire('ff4_vir_smart_tiers', 'smartTiers', async () => { await reapplyTiers(); });
@@ -2915,6 +3008,16 @@ function renderSettings() {
     wire('ff4_vir_bind_to_chat', 'bindToChat', async () => { if (settings().bindToChat) await activateCurrentWorld(); });
     wire('ff4_vir_cleanup_delete', 'cleanupOnChatDelete');
     wire('ff4_vir_debug', 'debug');
+    $('ff4_vir_chat_disabled')?.addEventListener('change', async function () {
+        await setChatOverrides({ ...getChatOverrides(), disabled: Boolean(this.checked) });
+        await activateCurrentWorld();
+        updateStatus();
+    });
+    $('ff4_vir_chat_template_mode')?.addEventListener('change', async function () {
+        await setChatOverrides({ ...getChatOverrides(), templateMode: this.value || '' });
+        await activateCurrentWorld();
+        updateStatus();
+    });
 
     $('ff4_vir_activate')?.addEventListener('click', async () => {
         await activateCurrentWorld();
@@ -2996,10 +3099,21 @@ function renderSettings() {
 
 async function updateStatus() {
     const worldName = currentWorldName();
+    const chatOverrides = getChatOverrides();
     const setEl = (id, value) => { const el = $(id); if (el) el.textContent = value; };
     setEl('ff4_vir_current_world', worldName || 'No active chat');
     setEl('ff4_vir_last_sync', settings().lastSyncStatus || 'No sync yet');
     setEl('ff4_vir_session_count', String(sessionPacketCount));
+    const chatDisabledEl = $('ff4_vir_chat_disabled');
+    if (chatDisabledEl) chatDisabledEl.checked = chatOverrides.disabled;
+    const chatTemplateEl = $('ff4_vir_chat_template_mode');
+    if (chatTemplateEl) chatTemplateEl.value = chatOverrides.templateMode || '';
+    const chatTemplateHintEl = $('ff4_vir_chat_template_hint');
+    if (chatTemplateHintEl) {
+        chatTemplateHintEl.textContent = chatOverrides.templateMode
+            ? `This chat overrides the global template (${settings().templateMode || 'Detailed'}) with ${chatOverrides.templateMode}.`
+            : `Using global template: ${settings().templateMode || 'Detailed'}.`;
+    }
 
     const bound = chat_metadata?.[WI_METADATA_KEY] === worldName;
     const boundEl = $('ff4_vir_bound');
@@ -3049,7 +3163,7 @@ async function updateStatus() {
                 `<div><b>[${escapeHtml(c.tier)}]</b> ${escapeHtml(c.name)} — ${escapeHtml(c.reason)} · depth ${escapeHtml(c.depth ?? '--')} · order ${escapeHtml(c.order ?? '--')}</div>`
             ).join('') || '<div>No character entries yet.</div>';
             diagEl.innerHTML = `
-                <div><b>Mode:</b> ${escapeHtml(snap.templateMode)} · <b>Depths:</b> contract ${VIR_CONTRACT_DEPTH}, state ${VIR_STATE_DEPTH}, priority ${VIR_PRIORITY_DEPTH}</div>
+                <div><b>Mode:</b> ${escapeHtml(snap.templateMode)}${snap.chatTemplateOverride ? ` · <b>Chat override:</b> ${escapeHtml(snap.chatTemplateOverride)}` : ''} · <b>Disabled:</b> ${escapeHtml(String(snap.chatDisabled))} · <b>Depths:</b> contract ${VIR_CONTRACT_DEPTH}, state ${VIR_STATE_DEPTH}, priority ${VIR_PRIORITY_DEPTH}</div>
                 <div><b>Misses:</b> streak ${escapeHtml(snap.missStreak)}, total ${escapeHtml(snap.totalMisses)} · <b>Tokens:</b> ${escapeHtml(snap.tokenEstimate)}</div>
                 <div><b>Injection model:</b> v6 — SillyTavern keyword-gating. The extension only writes lorebook entries with tier flags (constant/order/depth); ST decides what gets injected. No setExtensionPrompt dump.</div>
                 <div>${rows}</div>`;
@@ -3131,7 +3245,7 @@ async function renderCharacterList() {
     // can't accidentally mix array/Set semantics.
     const pinned = new Set(st.pinnedCharacters?.[worldName] || []);
     const recall = st.recallCharacters?.[worldName] || {};
-    const activeTemplate = resolveTemplateMode(st.templateMode).label;
+    const activeTemplate = resolveTemplateMode(getEffectiveTemplate()).label;
     const rows = [];
     for (const [, entry] of chars) {
         const name = characterEntryName(entry);
@@ -3344,7 +3458,7 @@ async function refreshCharacterViaAI(name, opts = {}) {
     const existing = findCharacterEntry(data, name);
     const existingContent = existing?.content || '';
 
-    const templateMode = settings().templateMode || 'Detailed';
+    const templateMode = getEffectiveTemplate();
     const systemPrompt = buildRefreshContract(name, templateMode, existingContent);
     const userPrompt = `Refresh VIR for ${name}.`;
 
@@ -3597,6 +3711,7 @@ jQuery(async () => {
 // world and applies the colour to that character's .name_text label in chat DOM.
 // Pure DOM styling — no markdown injection, no message mutation.
 async function getDialogueColorMap() {
+    if (isVirDisabledForChat()) return new Map();
     const worldName = currentWorldName();
     if (!worldName) return new Map();
     const data = await loadWorldInfo(worldName).catch(() => null);
