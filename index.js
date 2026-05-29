@@ -1,4 +1,4 @@
-// FF4 VIR Lorebook Sync — v6.2.0 (per-chat template override + per-chat disable)
+// FF4 VIR Lorebook Sync — v6.2.1 (chat lore conflict resolution + merged-mode safety)
 // v6 changes:
 //   - SillyTavern owns ALL injection. The extension only writes lorebook entries
 //     with tier flags (constant/order/depth/key[]); ST decides what gets injected
@@ -26,6 +26,7 @@ import {
     saveSettingsDebounced,
 } from '../../../../script.js';
 import { power_user } from '../../../power-user.js';
+import { Popup, POPUP_RESULT } from '../../../popup.js';
 import {
     METADATA_KEY as WI_METADATA_KEY,
     getWorldInfoSettings,
@@ -42,7 +43,7 @@ import {
 // CONSTANTS
 // ============================================================================
 const EXT = 'ff4-vir-lorebook-sync';
-const VERSION = '6.2.0';
+const VERSION = '6.2.1';
 const WORLD_PREFIX = 'FF4 VIR - ';
 const CHAT_OVERRIDE_KEY = 'ff4VirOverrides';
 
@@ -390,6 +391,7 @@ function getChatOverrides() {
     return {
         disabled: raw?.disabled === true,
         templateMode: hasTemplateOverride ? template : '',
+        mergeIntoChatLore: raw?.mergeIntoChatLore === true,
     };
 }
 
@@ -406,8 +408,9 @@ async function setChatOverrides(nextOverrides) {
     const normalized = {
         disabled: nextOverrides?.disabled === true,
         templateMode: nextOverrides?.templateMode ? resolveTemplateMode(nextOverrides.templateMode).label : '',
+        mergeIntoChatLore: nextOverrides?.mergeIntoChatLore === true,
     };
-    if (!normalized.disabled && !normalized.templateMode) {
+    if (!normalized.disabled && !normalized.templateMode && !normalized.mergeIntoChatLore) {
         delete chat_metadata[CHAT_OVERRIDE_KEY];
     } else {
         chat_metadata[CHAT_OVERRIDE_KEY] = normalized;
@@ -482,12 +485,21 @@ function safeNamePart(value) {
 function isVirWorldName(name) {
     return String(name || '').startsWith(WORLD_PREFIX);
 }
+function isUsingMergedChatLore() {
+    const bound = chat_metadata?.[WI_METADATA_KEY];
+    return settings().bindToChat === true
+        && getChatOverrides().mergeIntoChatLore === true
+        && !!bound
+        && !isVirWorldName(bound)
+        && (world_names || []).includes(bound);
+}
 function currentWorldName() {
     const chatId = getCurrentChatId();
     if (!chatId) return null;
     const stableId = chat_metadata?.integrity || chatId;
     const suffix = hashString(stableId);
     const bound = chat_metadata?.[WI_METADATA_KEY];
+    if (isUsingMergedChatLore()) return bound;
     if (bound && isVirWorldName(bound) && (world_names || []).includes(bound)) return bound;
     const existing = (world_names || []).find(n => String(n).startsWith(WORLD_PREFIX) && String(n).endsWith(`-${suffix}`));
     if (existing) return existing;
@@ -497,11 +509,85 @@ function currentWorldName() {
     return `${WORLD_PREFIX}${safeNamePart(chatId)}-${suffix}`;
 }
 function rememberWorldChat(worldName, chatId = getCurrentChatId()) {
-    if (!worldName || !chatId) return;
+    if (!worldName || !chatId || !isVirWorldName(worldName)) return;
     const st = settings();
     st.worldChatMap = st.worldChatMap || {};
     st.worldChatMap[worldName] = { chatId: String(chatId), integrity: chat_metadata?.integrity || null, updatedAt: Date.now() };
     saveSettingsDebounced();
+}
+
+function syncChatLorebookUi(boundWorldName = chat_metadata?.[WI_METADATA_KEY] || '') {
+    const worldName = String(boundWorldName || '');
+    const hasWorld = worldName && Array.isArray(world_names) && world_names.includes(worldName);
+    document.querySelectorAll('.chat_lorebook_button').forEach(el => {
+        el.classList.toggle('world_set', !!hasWorld);
+    });
+}
+
+function notifyLoreOperation(message, title = 'FF4 VIR') {
+    if (typeof toastr !== 'undefined' && message) {
+        toastr.info(message, title, { timeOut: 3500 });
+    }
+}
+
+function isManagedVirEntry(entry) {
+    if (!entry) return false;
+    if (entry.comment === RULES_ENTRY_COMMENT || entry.comment === RECOVERY_ENTRY_COMMENT ||
+        entry.comment === 'FF4 FF4_STATE' || entry.comment === 'FF4 VIR Roster') return true;
+    return /^VIR:\s*/i.test(String(entry.comment || '')) && /\[ACTIVE VIR:/i.test(String(entry.content || ''));
+}
+
+async function clearVirEntriesFromWorld(worldName) {
+    const data = await loadWorldInfo(worldName);
+    if (!data) return 0;
+    const entries = getEntries(data);
+    let removed = 0;
+    for (const [uid, entry] of Object.entries(entries)) {
+        if (!isManagedVirEntry(entry)) continue;
+        delete entries[uid];
+        removed++;
+    }
+    if (removed > 0) {
+        await saveWorldInfo(worldName, data, true);
+        await updateWorldInfoList();
+    }
+    delete settings().pinnedCharacters?.[worldName];
+    delete settings().recallCharacters?.[worldName];
+    saveSettingsDebounced();
+    return removed;
+}
+
+async function resolveChatLoreConflict(boundWorldName) {
+    const choice = await Popup.show.confirm(
+        'FF4 VIR chat lore conflict',
+        `This chat already uses the chat lorebook <b>${escapeHtml(boundWorldName)}</b>.<br><br>` +
+        `FF4 VIR cannot take the same chat-lore slot without a decision.<br><br>` +
+        `Choose one:<br>` +
+        `1. Switch FF4 VIR to global mode.<br>` +
+        `2. Merge FF4 VIR entries into the existing chat lorebook.`,
+        {
+            okButton: false,
+            cancelButton: 'Cancel',
+            customButtons: [
+                { text: 'Switch to global mode', result: POPUP_RESULT.CUSTOM1, classes: ['menu_button'] },
+                { text: 'Merge into existing chat lore', result: POPUP_RESULT.CUSTOM2, classes: ['menu_button'] },
+            ],
+        },
+    );
+    if (choice === POPUP_RESULT.CUSTOM1) {
+        settings().bindToChat = false;
+        saveSettingsDebounced();
+        await setChatOverrides({ ...getChatOverrides(), mergeIntoChatLore: false });
+        notifyLoreOperation(`FF4 VIR switched to global mode because this chat already uses "${boundWorldName}" as chat lore.`);
+        return 'global';
+    }
+    if (choice === POPUP_RESULT.CUSTOM2) {
+        await setChatOverrides({ ...getChatOverrides(), mergeIntoChatLore: true });
+        notifyLoreOperation(`FF4 VIR will merge into the existing chat lorebook "${boundWorldName}" for this chat.`);
+        return 'merge';
+    }
+    notifyLoreOperation(`FF4 VIR did not attach because this chat already uses "${boundWorldName}" as chat lore.`);
+    return 'cancel';
 }
 
 // ============================================================================
@@ -536,6 +622,11 @@ function enforceVirRecursionFlags(entry) {
     entry.preventRecursion = true;
     entry.scanDepth = 3;
     return entry;
+}
+
+function isUserVirEntry(entry) {
+    if (!entry || !Array.isArray(entry.key)) return false;
+    return entry.key.includes('{{user}}');
 }
 
 // ============================================================================
@@ -961,7 +1052,10 @@ function normalizeLegacyPicCopy(entry) {
 function parseActiveVir(content) {
     const m = String(content || '').match(/\[ACTIVE VIR:[^\]]+\]\s*([\s\S]*?)\s*\[\/ACTIVE VIR\]/);
     if (!m) return {};
-    return parseCardLines(m[1]);
+    const body = m[1];
+    const cardVir = parseCardLines(body);
+    if (Object.keys(cardVir).length) return cardVir;
+    return parseInlineVirLines(body);
 }
 
 function extractPicCopy(content) {
@@ -1017,6 +1111,97 @@ function parseCardLines(body) {
             if (buildBits.length) vir.build = buildBits.join('; ');
         }
     }
+    return vir;
+}
+
+function parseIdentitySummary(text, vir) {
+    const parts = String(text || '').split(/\s*,\s*/).map(s => s.trim()).filter(Boolean);
+    if (!parts.length) return;
+    if (!vir.species) vir.species = parts[0];
+    const buildBits = [];
+    for (const part of parts.slice(1)) {
+        if (!vir.age_appearance && /^age\b/i.test(part)) {
+            vir.age_appearance = part.replace(/^age\s*/i, '').trim();
+        } else if (!vir.height && /(\d+\s*cm|\bcm\b|\bfeet\b|\bft\b|tall)/i.test(part)) {
+            vir.height = part;
+        } else if (!vir.hair && /\bhair\b/i.test(part)) {
+            vir.hair = part;
+        } else if (!vir.eyes && /\beyes?\b/i.test(part)) {
+            vir.eyes = part.replace(/\seyes?$/i, '').trim();
+        } else if (!vir.skin_fur_scales && /\bskin\b/i.test(part)) {
+            vir.skin_fur_scales = part.replace(/\sskin$/i, '').trim();
+        } else {
+            buildBits.push(part);
+        }
+    }
+    if (buildBits.length && !vir.build) vir.build = buildBits.join('; ');
+}
+
+function parseInlineVirLines(body) {
+    const vir = {};
+    let text = String(body || '')
+        .replace(/^Canonical name\+source for image prompts:.*$/gim, '')
+        .trim();
+    if (!text) return vir;
+
+    const sourceMatch = text.match(/(?:^|\n)Source:\s*([^.]+)\./i);
+    if (sourceMatch) vir.source = sourceMatch[1].trim();
+
+    const identityMatch = text.match(/(?:^|\n)Identity:\s*([\s\S]*?)(?=\nState:|\nLocation:|\nDialogue colour:|$)/i);
+    if (identityMatch) {
+        const segments = identityMatch[1].replace(/\s+/g, ' ').trim().replace(/\.$/, '').split(/\s*;\s*/).filter(Boolean);
+        if (segments.length) parseIdentitySummary(segments[0], vir);
+        for (const segment of segments.slice(1)) {
+            if (!vir.hair && /^hair:/i.test(segment)) vir.hair = segment.replace(/^hair:\s*/i, '').trim();
+            else if (!vir.eyes && /^eyes:/i.test(segment)) vir.eyes = segment.replace(/^eyes:\s*/i, '').trim();
+            else if (!vir.skin_fur_scales && /^skin:/i.test(segment)) vir.skin_fur_scales = segment.replace(/^skin:\s*/i, '').trim();
+            else if (!vir.face_features && /^face:/i.test(segment)) vir.face_features = segment.replace(/^face:\s*/i, '').trim();
+            else if (!vir.body && /^body:/i.test(segment)) vir.body = segment.replace(/^body:\s*/i, '').trim();
+            else if (!vir.marks && /^marks:/i.test(segment)) vir.marks = segment.replace(/^marks:\s*/i, '').trim();
+            else if (!vir.non_human) vir.non_human = segment.trim();
+        }
+    }
+
+    const stateMatch = text.match(/(?:^|\n)State:\s*([\s\S]*?)(?=\nLocation:|\nDialogue colour:|$)/i);
+    if (stateMatch) {
+        const segments = stateMatch[1].replace(/\s+/g, ' ').trim().replace(/\.$/, '').split(/\s*;\s*/).filter(Boolean);
+        for (const segment of segments) {
+            if (/^outfit:/i.test(segment)) vir.outfit = splitPackedFacts(segment.replace(/^outfit:\s*/i, ''));
+            else if (/^underwear:/i.test(segment)) vir.underwear = splitPackedFacts(segment.replace(/^underwear:\s*/i, ''));
+            else if (/^accessories:/i.test(segment)) vir.accessories = splitPackedFacts(segment.replace(/^accessories:\s*/i, ''));
+            else if (/^holding:/i.test(segment)) vir.holding = segment.replace(/^holding:\s*/i, '').trim();
+            else if (/^pose:/i.test(segment)) vir.pose = segment.replace(/^pose:\s*/i, '').trim();
+            else if (/^expression:/i.test(segment)) vir.expression = segment.replace(/^expression:\s*/i, '').trim();
+            else if (/^condition:/i.test(segment)) vir.condition = segment.replace(/^condition:\s*/i, '').trim();
+        }
+    }
+
+    const locationMatch = text.match(/(?:^|\n)Location:\s*([^.]+)\./i);
+    if (locationMatch) vir.location_context = locationMatch[1].trim();
+    const colorMatch = text.match(/(?:^|\n)Dialogue colour:\s*(#[0-9a-f]{3,8})\./i);
+    if (colorMatch) {
+        vir.voice_lock = vir.voice_lock || {};
+        vir.voice_lock.dialogue_color = colorMatch[1].trim();
+    }
+
+    if (!Object.keys(vir).length) {
+        text = text.replace(/^\[VIR:[^\]]+\]\s*/i, '').trim();
+        const outfitMatch = text.match(/Outfit:\s*([^.\n]+)\./i);
+        if (outfitMatch) vir.outfit = splitPackedFacts(outfitMatch[1]);
+        const poseTail = outfitMatch ? text.slice(text.indexOf(outfitMatch[0]) + outfitMatch[0].length).trim() : '';
+        if (poseTail) {
+            const stateParts = poseTail.replace(/\.$/, '').split(/\s*,\s*/).filter(Boolean);
+            if (stateParts.length) {
+                vir.pose = stateParts[0].trim();
+                if (stateParts.length > 1) vir.expression = stateParts.slice(1).join(', ').trim();
+            }
+        }
+        const beforeOutfit = outfitMatch ? text.slice(0, text.indexOf(outfitMatch[0])).trim() : text;
+        const sentences = beforeOutfit.split(/\.\s*/).map(s => s.trim()).filter(Boolean);
+        if (sentences.length) parseIdentitySummary(sentences[0].replace(/^from\s+/i, ''), vir);
+        if (sentences.length > 1 && !vir.non_human) vir.non_human = sentences[1];
+    }
+
     return vir;
 }
 
@@ -1302,21 +1487,31 @@ function setActiveFlags(data, activeNames, pinnedNames = new Set(), recallNames 
         if (!name) continue;
         normalizeLegacyPicCopy(entry);
         enforceVirRecursionFlags(entry);
+        const userEntry = isUserVirEntry(entry);
         if (pinnedNames.has(name)) {
-            entry.constant = true; entry.order = TIER.PINNED.order; entry.depth = TIER.PINNED.depth;
+            entry.constant = userEntry; entry.order = TIER.PINNED.order; entry.depth = TIER.PINNED.depth;
         } else if (activeNames.has(name)) {
-            entry.constant = true; entry.order = TIER.ACTIVE.order; entry.depth = TIER.ACTIVE.depth;
+            entry.constant = userEntry; entry.order = TIER.ACTIVE.order; entry.depth = TIER.ACTIVE.depth;
         } else if (recallNames.has(name)) {
-            entry.constant = true; entry.order = TIER.RECALL.order; entry.depth = TIER.RECALL.depth;
+            entry.constant = userEntry; entry.order = TIER.RECALL.order; entry.depth = TIER.RECALL.depth;
         } else {
             // OFFSCREEN — smart mode: keyword-only (no constant); else: behave like active
             if (smart) {
-                entry.constant = false; entry.order = TIER.OFFSCREEN.order; entry.depth = TIER.OFFSCREEN.depth;
+                entry.constant = userEntry; entry.order = TIER.OFFSCREEN.order; entry.depth = TIER.OFFSCREEN.depth;
             } else {
-                entry.constant = true; entry.order = TIER.ACTIVE.order; entry.depth = TIER.ACTIVE.depth;
+                entry.constant = userEntry; entry.order = TIER.ACTIVE.order; entry.depth = TIER.ACTIVE.depth;
             }
         }
     }
+}
+
+function getCharacterTierInfo(entry, name, pinnedNames = new Set(), recallMap = {}) {
+    if (pinnedNames.has(name)) return { tier: 'PIN', color: '#FFD180', reason: 'pinned keyword-triggered' };
+    if (recallMap[name]) return { tier: `RCL${recallMap[name]}`, color: '#B39DDB', reason: `recall ${recallMap[name]} turns keyword-triggered` };
+    if (entry?.order === TIER.ACTIVE.order && entry?.depth === TIER.ACTIVE.depth) {
+        return { tier: 'ACT', color: '#A5D6A7', reason: 'active keyword-triggered' };
+    }
+    return { tier: 'OFF', color: '#aab4c0', reason: 'offscreen keyword-only' };
 }
 function activeNamesFrom(sync) {
     const names = new Set();
@@ -1684,12 +1879,33 @@ function robustJsonParse(rawContent) {
 }
 
 function parsePacket(packet) {
-    const result = robustJsonParse(packet.body);
+    const raw = typeof packet === 'string' ? packet : packet?.body;
+    const result = robustJsonParse(raw);
     const data = result.data;
     if (!data || typeof data !== 'object') throw new Error('Packet is not an object');
     if (data.schema !== 1 && data.schema !== 2 && data.schema !== 3) throw new Error(`Unsupported schema: ${data.schema}`);
     if (result.recovered) log(`JSON recovered via pass ${result.repairAttempts}`);
     return data;
+}
+
+function parseRefreshCharacterBlock(block, fallbackName = '') {
+    const text = String(block || '').trim();
+    if (!text) return null;
+    const activeMatch = text.match(/\[ACTIVE VIR:\s*([^\]]+)\]/i);
+    if (activeMatch) {
+        const vir = parseActiveVir(text);
+        if (Object.keys(vir).length) {
+            return { name: activeMatch[1].trim() || fallbackName, vir };
+        }
+    }
+    const lockedMatch = text.match(/\[LOCKED VISUAL CARD:\s*([^\]]+)\]/i);
+    if (lockedMatch) {
+        const vir = parseCardLines(text);
+        if (Object.keys(vir).length) {
+            return { name: lockedMatch[1].trim() || fallbackName, vir };
+        }
+    }
+    return null;
 }
 
 /**
@@ -1886,12 +2102,33 @@ async function ensureWorldLoaded(worldName) {
     return data;
 }
 async function activateCurrentWorld() {
+    if (settings().bindToChat) {
+        const boundChatLore = chat_metadata?.[WI_METADATA_KEY];
+        if (boundChatLore && !isVirWorldName(boundChatLore) && (world_names || []).includes(boundChatLore) && !isUsingMergedChatLore()) {
+            const resolution = await resolveChatLoreConflict(boundChatLore);
+            if (resolution === 'cancel') {
+                clearVirContract();
+                updateStatus();
+                return;
+            }
+        }
+    }
     const worldName = currentWorldName();
     if (!worldName) return;
+    const wiSettings = getWorldInfoSettings();
+    const active = Array.isArray(selected_world_info) ? selected_world_info : [];
+    const nonVirActive = active.filter(n => !isVirWorldName(n));
+    const mergedChatLore = isUsingMergedChatLore();
     if (isVirDisabledForChat()) {
-        const wiSettings = getWorldInfoSettings();
-        const active = Array.isArray(selected_world_info) ? selected_world_info : [];
-        updateWorldInfoSettings(wiSettings, active.filter(n => n !== worldName));
+        if (active.length !== nonVirActive.length) {
+            updateWorldInfoSettings(wiSettings, nonVirActive);
+        }
+        if (!mergedChatLore && typeof chat_metadata === 'object' && chat_metadata && chat_metadata[WI_METADATA_KEY] === worldName) {
+            delete chat_metadata[WI_METADATA_KEY];
+            try { await saveMetadata(); } catch (e) { warn('saveMetadata failed', e); }
+            notifyLoreOperation(`Detached FF4 VIR lorebook "${worldName}" from this chat.`);
+        }
+        syncChatLorebookUi(mergedChatLore ? (chat_metadata?.[WI_METADATA_KEY] || '') : '');
         clearVirContract();
         updateStatus();
         return;
@@ -1904,17 +2141,31 @@ async function activateCurrentWorld() {
         rebuildRosterEntry(data);
         await saveWorldInfo(worldName, data, true);
     } catch (e) { warn('user persona seed failed', e); }
-    const wiSettings = getWorldInfoSettings();
-    // selected_world_info is a module-level `let` exported from world-info.js — it's the
-    // backing array for ST's "Active World(s) for all chats" UI. NOT part of wiSettings.
-    const active = Array.isArray(selected_world_info) ? selected_world_info : [];
-    const nextGlobal = [...active.filter(n => n !== worldName && !isVirWorldName(n)), worldName];
-    updateWorldInfoSettings(wiSettings, [...new Set(nextGlobal)]);
-    if (settings().bindToChat && typeof chat_metadata === 'object') {
-        if (chat_metadata[WI_METADATA_KEY] !== worldName) {
+    // Chat-bound mode must use chat_metadata only. Putting the VIR world into
+    // selected_world_info makes ST treat it as a global lorebook and breaks
+    // per-chat attach/detach on chat switches.
+    if (settings().bindToChat) {
+        if (active.length !== nonVirActive.length) {
+            updateWorldInfoSettings(wiSettings, nonVirActive);
+        }
+        const previousBound = chat_metadata?.[WI_METADATA_KEY];
+        if (typeof chat_metadata === 'object' && chat_metadata && chat_metadata[WI_METADATA_KEY] !== worldName) {
             chat_metadata[WI_METADATA_KEY] = worldName;
             try { await saveMetadata(); } catch (e) { warn('saveMetadata failed', e); }
         }
+        syncChatLorebookUi(worldName);
+        if (previousBound !== worldName && isVirWorldName(worldName)) {
+            notifyLoreOperation(`Attached FF4 VIR lorebook "${worldName}" to this chat.`);
+        }
+    } else {
+        const nextGlobal = [...nonVirActive, worldName];
+        updateWorldInfoSettings(wiSettings, [...new Set(nextGlobal)]);
+        if (typeof chat_metadata === 'object' && chat_metadata && chat_metadata[WI_METADATA_KEY] === worldName) {
+            delete chat_metadata[WI_METADATA_KEY];
+            try { await saveMetadata(); } catch (e) { warn('saveMetadata failed', e); }
+            notifyLoreOperation(`Detached FF4 VIR lorebook "${worldName}" from this chat.`);
+        }
+        syncChatLorebookUi('');
     }
     await injectVirContract();
     // v6 — injectVirState() removed. ST owns lorebook injection now.
@@ -1925,6 +2176,12 @@ async function deleteVirWorld(worldName) {
     const wiSettings = getWorldInfoSettings();
     const active = Array.isArray(selected_world_info) ? selected_world_info : [];
     updateWorldInfoSettings(wiSettings, active.filter(n => n !== worldName));
+    if (typeof chat_metadata === 'object' && chat_metadata && chat_metadata[WI_METADATA_KEY] === worldName) {
+        delete chat_metadata[WI_METADATA_KEY];
+        try { await saveMetadata(); } catch (e) { warn('saveMetadata failed', e); }
+        notifyLoreOperation(`Detached FF4 VIR lorebook "${worldName}" from this chat.`);
+    }
+    syncChatLorebookUi('');
     const deleted = await deleteWorldInfo(worldName);
     if (deleted) { delete settings().worldChatMap?.[worldName]; saveSettingsDebounced(); }
     return deleted;
@@ -2633,8 +2890,8 @@ async function registerSlashCommands() {
             const lines = [`VIR Characters (${chars.length}):`];
             for (const [, entry] of chars) {
                 const name = characterEntryName(entry);
-                let tier = entry.constant ? (pinned.has(name) ? '[PIN]' : (recall[name] ? `[RECALL:${recall[name]}t]` : '[ACT]')) : '[OFF]';
-                lines.push(`  ${tier} ${name}`);
+                const tier = getCharacterTierInfo(entry, name, pinned, recall).tier;
+                lines.push(`  [${tier}] ${name}`);
             }
             return lines.join('\n');
         };
@@ -2797,14 +3054,11 @@ async function buildDiagnosticsSnapshot() {
             if (!name) continue;
             const constant = entry.constant !== false && !entry.disable;
             if (constant) totalChars += String(entry.content || '').length;
-            const reason = pinned.has(name) ? 'pinned'
-                : recall[name] ? `recall ${recall[name]} turns`
-                : constant ? 'active/constant'
-                : 'offscreen keyword-only';
+            const tierInfo = getCharacterTierInfo(entry, name, pinned, recall);
             snapshot.characters.push({
                 name,
-                tier: pinned.has(name) ? 'PIN' : recall[name] ? 'RCL' : constant ? 'ACT' : 'OFF',
-                reason,
+                tier: tierInfo.tier.replace(/\d+$/, ''),
+                reason: constant && isUserVirEntry(entry) ? `${tierInfo.reason}; user entry constant` : tierInfo.reason,
                 order: entry.order,
                 depth: entry.depth,
                 constant,
@@ -2849,7 +3103,7 @@ window.ff4VirGetPicCopies = async function ff4VirGetPicCopies(names = []) {
             if (wanted.size && !wanted.has(name.toLowerCase())) continue;
             const vir = parseActiveVir(entry.content || '');
             const constant = entry.constant !== false && !entry.disable;
-            const tier = pinned.has(name) ? 'PIN' : recall[name] ? 'RCL' : constant ? 'ACT' : 'OFF';
+            const tier = getCharacterTierInfo(entry, name, pinned, recall).tier.replace(/\d+$/, '');
             out[name] = {
                 name,
                 tier,
@@ -2879,7 +3133,7 @@ function renderSettings() {
                     <div class="ff4-vir-subtitle">v${VERSION} — Dynamic character tracking · Auto-injected contract</div>
 
                     <label class="ff4-vir-tog" title="Master toggle. Disabling stops all extension activity."><input id="ff4_vir_enabled" type="checkbox"> <span>Enabled</span></label>
-                    <label class="ff4-vir-tog" title="Smart tiers: only scene-active + pinned + recalled chars inject as constant. Offscreen chars are keyword-only (zero token cost until name appears in chat)."><input id="ff4_vir_smart_tiers" type="checkbox"> <span>Smart dynamic tiers (recommended)</span></label>
+                    <label class="ff4-vir-tog" title="Smart tiers: character VIR entries stay keyword-triggered, but their order/depth follows pinned, active, and recall state. The seeded {{user}} entry may stay constant."><input id="ff4_vir_smart_tiers" type="checkbox"> <span>Smart dynamic tiers (recommended)</span></label>
                     <label class="ff4-vir-tog" title="Strip the AI's emitted vir packet from the visible chat so prose stays clean."><input id="ff4_vir_auto_hide" type="checkbox"> <span>Auto-hide synced packets</span></label>
                     <label class="ff4-vir-tog" title="Inject the VIR contract + current world state into every generation. Like RPG HUD — no preset edit needed."><input id="ff4_vir_contract" type="checkbox"> <span>Auto-inject contract + state</span></label>
 
@@ -3005,7 +3259,7 @@ function renderSettings() {
     }
     wire('ff4_vir_seed_user', 'seedUserPersona', async () => { if (settings().seedUserPersona) await activateCurrentWorld(); });
     wire('ff4_vir_diagnostics', 'diagnosticsEnabled', updateStatus);
-    wire('ff4_vir_bind_to_chat', 'bindToChat', async () => { if (settings().bindToChat) await activateCurrentWorld(); });
+    wire('ff4_vir_bind_to_chat', 'bindToChat', async () => { await activateCurrentWorld(); });
     wire('ff4_vir_cleanup_delete', 'cleanupOnChatDelete');
     wire('ff4_vir_debug', 'debug');
     $('ff4_vir_chat_disabled')?.addEventListener('change', async function () {
@@ -3110,9 +3364,13 @@ async function updateStatus() {
     if (chatTemplateEl) chatTemplateEl.value = chatOverrides.templateMode || '';
     const chatTemplateHintEl = $('ff4_vir_chat_template_hint');
     if (chatTemplateHintEl) {
-        chatTemplateHintEl.textContent = chatOverrides.templateMode
+        const templateText = chatOverrides.templateMode
             ? `This chat overrides the global template (${settings().templateMode || 'Detailed'}) with ${chatOverrides.templateMode}.`
             : `Using global template: ${settings().templateMode || 'Detailed'}.`;
+        const bindText = settings().bindToChat && chatOverrides.mergeIntoChatLore
+            ? ' FF4 VIR is merged into the existing chat lorebook for this chat.'
+            : settings().bindToChat ? ' FF4 VIR is using its own chat-lore slot for this chat.' : ' FF4 VIR is using global lorebook activation.';
+        chatTemplateHintEl.textContent = `${templateText}${bindText}`;
     }
 
     const bound = chat_metadata?.[WI_METADATA_KEY] === worldName;
@@ -3165,7 +3423,7 @@ async function updateStatus() {
             diagEl.innerHTML = `
                 <div><b>Mode:</b> ${escapeHtml(snap.templateMode)}${snap.chatTemplateOverride ? ` · <b>Chat override:</b> ${escapeHtml(snap.chatTemplateOverride)}` : ''} · <b>Disabled:</b> ${escapeHtml(String(snap.chatDisabled))} · <b>Depths:</b> contract ${VIR_CONTRACT_DEPTH}, state ${VIR_STATE_DEPTH}, priority ${VIR_PRIORITY_DEPTH}</div>
                 <div><b>Misses:</b> streak ${escapeHtml(snap.missStreak)}, total ${escapeHtml(snap.totalMisses)} · <b>Tokens:</b> ${escapeHtml(snap.tokenEstimate)}</div>
-                <div><b>Injection model:</b> v6 — SillyTavern keyword-gating. The extension only writes lorebook entries with tier flags (constant/order/depth); ST decides what gets injected. No setExtensionPrompt dump.</div>
+                <div><b>Injection model:</b> v6 — character VIR entries are keyword-gated by SillyTavern. Tier flags adjust order/depth and only the seeded {{user}} entry may remain constant. No setExtensionPrompt dump.</div>
                 <div>${rows}</div>`;
         }
     }
@@ -3250,11 +3508,9 @@ async function renderCharacterList() {
     for (const [, entry] of chars) {
         const name = characterEntryName(entry);
         if (!name) continue;
-        let tier, tierColor;
-        if (pinned.has(name)) { tier = 'PIN'; tierColor = '#FFD180'; }
-        else if (entry.constant && recall[name]) { tier = `RCL${recall[name]}`; tierColor = '#B39DDB'; }
-        else if (entry.constant) { tier = 'ACT'; tierColor = '#A5D6A7'; }
-        else { tier = 'OFF'; tierColor = '#aab4c0'; }
+        const tierInfo = getCharacterTierInfo(entry, name, pinned, recall);
+        const tier = tierInfo.tier;
+        const tierColor = tierInfo.color;
         const vir = parseActiveVir(entry.content || '');
         const color = vir?.voice_lock?.dialogue_color || '';
         const pct = virCompleteness(vir);
@@ -3278,14 +3534,16 @@ async function renderCharacterList() {
         // Stored URI-encoded so the HTML attribute can't be broken by quotes.
         const preview = (entry.content || '').slice(0, 1500);
         const previewAttr = encodeURIComponent(preview);
-        rows.push(`<div class="ff4-vir-char-row" data-entry-preview="${previewAttr}">
-            <span class="ff4-vir-char-tier" style="color:${tierColor}">[${tier}]</span>
-            <span class="ff4-vir-char-name">${escapeHtml(name)}</span>
-            <span class="ff4-vir-char-completeness" style="color:${pctColor}" title="VIR completeness ${pct}% — fraction of identity fields populated, weighted by importance.\n${tokenInfo}">${pct}%</span>
-            ${mismatchBadge}
-            ${color ? `<span style="color:${color};font-weight:600" title="Dialogue colour: ${color}">●</span>` : ''}
+        rows.push(`<div class="ff4-vir-char-row">
+            <span class="ff4-vir-preview-trigger" data-entry-preview="${previewAttr}">
+                <span class="ff4-vir-char-tier" style="color:${tierColor}">[${tier}]</span>
+                <span class="ff4-vir-char-name">${escapeHtml(name)}</span>
+                <span class="ff4-vir-char-completeness" style="color:${pctColor}" title="VIR completeness ${pct}% — fraction of identity fields populated, weighted by importance.\n${tokenInfo}">${pct}%</span>
+                ${mismatchBadge}
+                ${color ? `<span style="color:${color};font-weight:600" title="Dialogue colour: ${color}">●</span>` : ''}
+            </span>
             <button class="ff4-vir-pin-btn menu_button" data-name="${escapeHtml(name)}" data-action="${pinned.has(name) ? 'park' : 'pin'}">${pinned.has(name) ? 'Unpin' : 'Pin'}</button>
-            <button class="ff4-vir-refresh-btn menu_button" data-name="${escapeHtml(name)}" title="${escapeHtml(refreshTitle)}" ${locked ? 'disabled' : ''}>🔄</button>
+            <button class="ff4-vir-refresh-btn menu_button" data-name="${escapeHtml(name)}" title="${escapeHtml(refreshTitle)}" ${locked ? 'disabled' : ''}><span class="fa-solid fa-rotate-right"></span></button>
         </div>`);
     }
     container.innerHTML = rows.join('');
@@ -3299,21 +3557,21 @@ async function renderCharacterList() {
         _previewPopover.className = 'ff4-vir-preview-popover';
         document.body.appendChild(_previewPopover);
     }
-    container.querySelectorAll('.ff4-vir-char-row[data-entry-preview]').forEach(row => {
-        row.addEventListener('mouseenter', () => {
-            const text = decodeURIComponent(row.getAttribute('data-entry-preview') || '');
+    container.querySelectorAll('.ff4-vir-preview-trigger[data-entry-preview]').forEach(trigger => {
+        trigger.addEventListener('mouseenter', () => {
+            const text = decodeURIComponent(trigger.getAttribute('data-entry-preview') || '');
             if (!text) return;
             _previewPopover.textContent = text;
             _previewPopover.style.display = 'block';
             // Position to the right of the row (or below if no room).
-            const rect = row.getBoundingClientRect();
+            const rect = trigger.getBoundingClientRect();
             const popW = Math.min(420, window.innerWidth - 40);
             _previewPopover.style.maxWidth = popW + 'px';
             const left = Math.min(rect.right + 12, window.innerWidth - popW - 10);
             _previewPopover.style.left = Math.max(10, left) + 'px';
             _previewPopover.style.top = (rect.top + window.scrollY) + 'px';
         });
-        row.addEventListener('mouseleave', () => {
+        trigger.addEventListener('mouseleave', () => {
             _previewPopover.style.display = 'none';
         });
     });
@@ -3336,7 +3594,7 @@ async function renderCharacterList() {
             const name = btn.getAttribute('data-name');
             if (!name || btn.classList.contains('ff4-vir-busy')) return;
             btn.classList.add('ff4-vir-busy');
-            btn.textContent = '…';
+            btn.innerHTML = '<span class="fa-solid fa-spinner fa-spin"></span>';
             btn.disabled = true;
             try {
                 await refreshCharacterViaAI(name);
@@ -3347,9 +3605,7 @@ async function renderCharacterList() {
                 }
             } finally {
                 btn.classList.remove('ff4-vir-busy');
-                btn.textContent = '🔄';
-                btn.disabled = false;
-                updateStatus();
+                await updateStatus();
             }
         });
     });
@@ -3419,12 +3675,19 @@ function buildRefreshContract(name, templateMode, existingContent) {
         `   Stable identity = species, age, height, build, hair, eyes, skin, face,`,
         `   marks, non-human features, body, anatomy.`,
         `2. Update mutable state (outfit, accessories, holding, pose, expression,`,
-        `   condition, location_context, hair_state) from the recent chat tail if`,
-        `   anything visibly changed.`,
-        `3. Emit ONE \`\`\`vir code-fence containing ONE character entry for ${name}.`,
-        `   Do not include any other characters, scene metadata, recall, or commentary.`,
+        `   condition, location_context, hair_state) ONLY from the RECENT CHAT block below.`,
+        `   Do not infer changes from any other hidden scene/context source.`,
+        `3. Emit ONE \`\`\`vir code-fence containing EXACTLY this structure for ${name}:`,
+        `   [ACTIVE VIR: ${name}]`,
+        `   Canonical name+source for image prompts: ...`,
+        `   [LOCKED VISUAL CARD: ${name}]`,
+        `   ...field lines...`,
+        `   [/LOCKED VISUAL CARD]`,
+        `   [/ACTIVE VIR]`,
+        `   Do not include JSON, other characters, scene metadata, recall, or commentary.`,
         `   The fence is the only output.`,
-        `4. Stay inside the ${mode.budgetTokens}-token budget.`,
+        `4. This is structured refresh data only. The extension will re-render it into the TARGET TEMPLATE (${mode.label}) after parsing.`,
+        `5. Stay inside the ${mode.budgetTokens}-token budget.`,
         '',
         `EXISTING VIR SHEET FOR ${name}:`,
         existingContent || '(no existing entry — create from chat context)',
@@ -3475,7 +3738,7 @@ async function refreshCharacterViaAI(name, opts = {}) {
             prompt: userPrompt,
             systemPrompt,
             quietToLoud: false,
-            noContext: false,  // include recent chat context for visible-change detection
+            noContext: true,   // refresh must use only the explicit RECENT CHAT tail in systemPrompt
         });
     } catch (e1) {
         try {
@@ -3490,52 +3753,60 @@ async function refreshCharacterViaAI(name, opts = {}) {
     let virBlockMatch = reply.match(/```vir\b\s*\n?([\s\S]*?)\n?```/i);
     if (!virBlockMatch) virBlockMatch = reply.match(/<vir_sync\b[^>]*>([\s\S]*?)<\/vir_sync>/i);
     if (!virBlockMatch) throw new Error('AI returned no vir block');
-    const jsonText = virBlockMatch[1].trim();
-    let parsed;
-    try {
-        parsed = parsePacket(jsonText);
-    } catch (err) {
-        throw new Error(`could not parse vir packet: ${err.message}`);
-    }
-    if (!parsed) throw new Error('vir packet parsed but empty');
-
-    // Find this character's entry inside the packet.
-    let charPayload = null;
-    if (Array.isArray(parsed.characters)) {
-        charPayload = parsed.characters.find(c => {
-            if (!c?.name) return false;
-            return canonicalizeName(c.name).canonical === canonicalizeName(name).canonical;
-        });
-    }
-    if (!charPayload && parsed.new_characters) {
-        for (const [k, v] of Object.entries(parsed.new_characters)) {
-            if (canonicalizeName(k).canonical === canonicalizeName(name).canonical) {
-                charPayload = { name: k, ...v };
-                break;
-            }
-        }
-    }
-    if (!charPayload && parsed.vir_delta) {
-        for (const [k, v] of Object.entries(parsed.vir_delta)) {
-            if (canonicalizeName(k).canonical === canonicalizeName(name).canonical) {
-                charPayload = { name: k, ...v };
-                break;
-            }
-        }
-    }
-    if (!charPayload) {
-        throw new Error(`AI returned a vir block but no entry for "${name}"`);
-    }
-
-    // Safety: AI sometimes drifts and returns a different character. Reject.
-    const returnedName = canonicalizeName(charPayload.name).canonical;
     const expectedName = canonicalizeName(name).canonical;
+    const blockText = virBlockMatch[1].trim();
+    let newVir = null;
+    let returnedName = expectedName;
+    try {
+        const parsed = parsePacket(blockText);
+        if (!parsed) throw new Error('vir packet parsed but empty');
+
+        // Find this character's entry inside the packet.
+        let charPayload = null;
+        if (Array.isArray(parsed.characters)) {
+            charPayload = parsed.characters.find(c => {
+                if (!c?.name) return false;
+                return canonicalizeName(c.name).canonical === expectedName;
+            });
+        }
+        if (!charPayload && parsed.new_characters) {
+            for (const [k, v] of Object.entries(parsed.new_characters)) {
+                if (canonicalizeName(k).canonical === expectedName) {
+                    charPayload = { name: k, ...v };
+                    break;
+                }
+            }
+        }
+        if (!charPayload && parsed.vir_delta) {
+            for (const [k, v] of Object.entries(parsed.vir_delta)) {
+                if (canonicalizeName(k).canonical === expectedName) {
+                    charPayload = { name: k, ...v };
+                    break;
+                }
+            }
+        }
+        if (!charPayload) {
+            throw new Error(`AI returned a vir block but no entry for "${name}"`);
+        }
+
+        returnedName = canonicalizeName(charPayload.name).canonical;
+        newVir = flatCharToNested(charPayload);
+    } catch (packetErr) {
+        const parsedCard = parseRefreshCharacterBlock(blockText, name);
+        if (!parsedCard) {
+            throw new Error(`could not parse vir packet: ${packetErr.message}`);
+        }
+        returnedName = canonicalizeName(parsedCard.name).canonical;
+        newVir = parsedCard.vir;
+    }
     if (returnedName !== expectedName) {
         throw new Error(`AI returned "${returnedName}" instead of "${expectedName}"`);
     }
+    if (!newVir || !Object.keys(newVir).length) {
+        throw new Error('parsed refresh block but no VIR fields were found');
+    }
 
     // Safety: never let a refresh catastrophically shorten an entry.
-    const newVir = flatCharToNested(charPayload);
     if (existing) {
         const oldVir = parseActiveVir(existing.content || '');
         const oldPopulated = VIR_CORE_ANCHORS.filter(k => {
@@ -3652,13 +3923,22 @@ async function importVirFile(file) {
     } catch (e) { toastr.error(`Import failed: ${e.message}`, 'FF4 VIR'); }
 }
 async function resetCurrentChatVir() {
-    if (!confirm('Reset all VIR data for current chat? This deletes the lorebook.')) return;
     const worldName = currentWorldName();
     if (!worldName) return;
-    await deleteVirWorld(worldName);
-    await updateWorldInfoList();
-    toastr.info('Chat VIR reset.', 'FF4 VIR');
+    if (isVirWorldName(worldName)) {
+        if (!confirm('Reset all VIR data for current chat? This deletes the lorebook.')) return;
+        await deleteVirWorld(worldName);
+        await updateWorldInfoList();
+        toastr.info('Chat VIR reset.', 'FF4 VIR');
+        updateStatus();
+        return;
+    }
+    if (!confirm('Reset FF4 VIR entries for this chat? This will remove FF4-managed VIR entries from the current chat lorebook but keep the lorebook itself.')) return;
+    const removed = await clearVirEntriesFromWorld(worldName);
+    await setChatOverrides({ ...getChatOverrides(), mergeIntoChatLore: false });
+    toastr.info(`Removed ${removed} FF4 VIR entr${removed === 1 ? 'y' : 'ies'} from "${worldName}".`, 'FF4 VIR');
     updateStatus();
+    return;
 }
 
 // ============================================================================
@@ -3675,7 +3955,16 @@ function attachListeners() {
     _listenersAttached = true;
     eventSource.on(event_types.CHAT_CHANGED, async () => {
         await activateCurrentWorld();
+        renderCharacterList();
         if (settings().dialogueColorEnabled) setTimeout(applyDialogueColors, 200);
+    });
+    eventSource.on(event_types.CHAT_CREATED, async () => {
+        await activateCurrentWorld();
+        renderCharacterList();
+    });
+    eventSource.on(event_types.GROUP_CHAT_CREATED, async () => {
+        await activateCurrentWorld();
+        renderCharacterList();
     });
     eventSource.on(event_types.CHAT_DELETED, cleanupVirForDeletedChat);
     eventSource.on(event_types.GROUP_CHAT_DELETED, cleanupVirForDeletedChat);
@@ -3748,3 +4037,4 @@ async function applyDialogueColors() {
         warn('applyDialogueColors failed', err?.message);
     }
 }
+

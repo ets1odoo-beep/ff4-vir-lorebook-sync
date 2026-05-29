@@ -1,6 +1,6 @@
 # FF4 VIR Lorebook Sync — Remaining Work
 
-**Current shipped version:** 6.2.0
+**Current shipped version:** 6.2.1
 **Scope of this document:** items that are NOT done yet. Anything that has shipped in v6.0.0 or v6.1.0 has been removed from this file. See git history / commit messages for what was completed.
 
 ---
@@ -12,6 +12,16 @@
 - UI section for per-chat overrides in the settings panel.
 - `/vir-template` now targets the current chat by default and accepts `--global` for the global default.
 - Added `/vir-disable` and `/vir-enable` for current-chat control.
+
+---
+
+## Shipped in v6.2.1
+
+- Chat-lore conflict handling now prompts for a decision instead of silently taking the slot:
+  - switch FF4 VIR to global mode
+  - merge FF4 VIR entries into the existing chat lorebook
+- Attach/detach notifications added for dedicated FF4 VIR chat-lore operations.
+- Merged chat-lore mode no longer clears the user's existing chat-lore attachment when FF4 VIR is disabled.
 
 ---
 
