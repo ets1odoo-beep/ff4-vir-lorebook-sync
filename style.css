@@ -151,3 +151,50 @@
     padding: 2px 8px;
     min-width: 48px;
 }
+
+/* v6 P3-14 — completeness percent indicator per char */
+#ff4_vir_settings .ff4-vir-char-completeness {
+    font-size: 0.7em;
+    font-weight: 600;
+    min-width: 30px;
+    text-align: right;
+    letter-spacing: 0.04em;
+}
+
+/* v6 §4.7 — template-mismatch badge */
+#ff4_vir_settings .ff4-vir-mismatch-badge {
+    font-size: 0.7em;
+    color: #d7a900;
+    background: rgba(215, 169, 0, 0.12);
+    border: 1px solid rgba(215, 169, 0, 0.35);
+    border-radius: 3px;
+    padding: 1px 5px;
+    letter-spacing: 0.03em;
+    cursor: default;
+}
+
+/* v6 — template-mode hint under the selector */
+#ff4_vir_settings .ff4-vir-mode-hint {
+    display: block;
+    font-size: 0.78em;
+    margin-top: 4px;
+    opacity: 0.7;
+}
+
+/* v6 P3-13b — per-character Refresh button */
+#ff4_vir_settings .ff4-vir-refresh-btn {
+    font-size: 0.95em;
+    line-height: 1;
+    padding: 2px 6px;
+    min-width: 32px;
+}
+
+#ff4_vir_settings .ff4-vir-refresh-btn.ff4-vir-busy {
+    opacity: 0.55;
+    cursor: progress;
+    animation: ff4-vir-spin 1s linear infinite;
+}
+
+@keyframes ff4-vir-spin {
+    to { transform: rotate(360deg); }
+}
