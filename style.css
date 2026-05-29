@@ -181,6 +181,52 @@
     opacity: 0.7;
 }
 
+/* v6.1 — refresh-context + cooldown sliders inside Advanced drawer */
+#ff4_vir_settings .ff4-vir-slider-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 8px 0 4px 0;
+    font-size: 0.85em;
+}
+#ff4_vir_settings .ff4-vir-slider-row input[type="range"] {
+    flex: 1;
+    max-width: 200px;
+}
+#ff4_vir_settings .ff4-vir-slider-row span[id$="_val"] {
+    min-width: 28px;
+    font-weight: 600;
+    text-align: right;
+}
+
+/* v6.1 — entry preview popover on hover */
+.ff4-vir-preview-popover {
+    position: absolute;
+    z-index: 99999;
+    display: none;
+    background: var(--SmartThemeBlurTintColor, #1b1b22);
+    color: var(--hud-text, inherit);
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    border-radius: 6px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55);
+    padding: 10px 12px;
+    max-width: 420px;
+    max-height: 70vh;
+    overflow: auto;
+    white-space: pre-wrap;
+    font-family: var(--monoFontFamily, monospace);
+    font-size: 11px;
+    line-height: 1.4;
+    pointer-events: none;
+}
+
+/* v6.1 — disabled refresh button during cooldown */
+#ff4_vir_settings .ff4-vir-refresh-btn[disabled] {
+    opacity: 0.4;
+    cursor: not-allowed;
+    filter: grayscale(0.7);
+}
+
 /* v6 P3-13b — per-character Refresh button */
 #ff4_vir_settings .ff4-vir-refresh-btn {
     font-size: 0.95em;

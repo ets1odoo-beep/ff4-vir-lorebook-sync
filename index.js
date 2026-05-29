@@ -42,7 +42,7 @@ import {
 // CONSTANTS
 // ============================================================================
 const EXT = 'ff4-vir-lorebook-sync';
-const VERSION = '6.0.0';
+const VERSION = '6.1.0';
 const WORLD_PREFIX = 'FF4 VIR - ';
 
 // Tier system — re-applied every sync based on scene_state
@@ -103,6 +103,10 @@ const defaultSettings = {
     // lastInjectionPreview retired in v6 (state injection removed; debug
     // preview is built on demand from the live lorebook in the diagnostics
     // panel — see renderSettings).
+
+    // v6.1 — Refresh button settings
+    refreshContextTurns: 20,         // chat-tail size sent to AI during a refresh (5–50)
+    refreshDebounceMs: 30000,        // per-character lockout after successful refresh
     worldChatMap: {},
     pinnedCharacters: {},
     recallCharacters: {},
@@ -2623,6 +2627,23 @@ async function registerSlashCommands() {
         reg('vir-park',   park,   'Unpin/clear recall. Usage: /vir-park <Name>');
         reg('vir-list',   list,   'List all VIR characters with their tier.');
         reg('vir-status', status, 'Show FF4 VIR extension status.');
+        // v6.1 — quick template switch from chat input.
+        reg('vir-template', async (_args, value) => {
+            const target = String(value || '').trim();
+            if (!target) {
+                return `Current template: ${settings().templateMode || 'Detailed'} (per-char cap: ${resolveTemplateMode(settings().templateMode).budgetTokens} tok). Usage: /vir-template <Compact|Standard|Detailed>`;
+            }
+            const valid = ['Compact', 'Standard', 'Detailed'];
+            const match = valid.find(v => v.toLowerCase() === target.toLowerCase());
+            if (!match) return `Invalid template "${target}". Choose: ${valid.join(' | ')}`;
+            settings().templateMode = match;
+            saveSettingsDebounced();
+            const select = document.getElementById('ff4_vir_template_mode');
+            if (select) select.value = match;
+            if (settings().contractInjection) await injectVirContract();
+            renderCharacterList();
+            return `Template switched to ${match} (≤${resolveTemplateMode(match).budgetTokens} tok/char). Existing entries keep their old shape until refreshed.`;
+        }, 'Switch the global VIR template. Usage: /vir-template <Compact|Standard|Detailed>');
         reg('virsheet', async (args, value) => sheetDirective('sheet', value), 'Ask AI for a full VIR identity sheet. Usage: /virsheet <Name>');
         reg('virquick', async (args, value) => sheetDirective('quick', value), 'Ask AI for a compact visual VIR sheet. Usage: /virquick <Name>');
         reg('virrepair', async (args, value) => sheetDirective('repair', value), 'Ask AI to repair weak/missing VIR fields. Usage: /virrepair <Name>');
@@ -2802,6 +2823,18 @@ function renderSettings() {
                         <label class="ff4-vir-tog" title="Store the VIR lorebook reference in chat metadata so it re-activates automatically when you reopen this chat."><input id="ff4_vir_bind_to_chat" type="checkbox"> <span>Bind lorebook to current chat</span></label>
                         <label class="ff4-vir-tog" title="When a chat is deleted, also delete its VIR lorebook so orphaned lorebooks don't pile up."><input id="ff4_vir_cleanup_delete" type="checkbox"> <span>Delete VIR lorebook when chat deleted</span></label>
                         <label class="ff4-vir-tog" title="Verbose console logging + toasts for troubleshooting."><input id="ff4_vir_debug" type="checkbox"> <span>Debug logging</span></label>
+                        <div class="ff4-vir-slider-row" title="How many recent chat messages to send to the AI during a 🔄 Refresh. Lower = cheaper, less informed. Higher = more accurate state updates.">
+                            <label for="ff4_vir_refresh_turns">Refresh context (chat tail):</label>
+                            <input id="ff4_vir_refresh_turns" type="range" min="0" max="50" step="5" value="20">
+                            <span id="ff4_vir_refresh_turns_val">20</span>
+                            <span class="ff4-vir-muted">msgs</span>
+                        </div>
+                        <div class="ff4-vir-slider-row" title="Cooldown after a successful 🔄 Refresh before the same character can be refreshed again. Prevents click-spam.">
+                            <label for="ff4_vir_refresh_cooldown">Refresh cooldown:</label>
+                            <input id="ff4_vir_refresh_cooldown" type="range" min="0" max="120" step="10" value="30">
+                            <span id="ff4_vir_refresh_cooldown_val">30</span>
+                            <span class="ff4-vir-muted">s</span>
+                        </div>
                     </details>
 
                     <div class="ff4-vir-status">
@@ -2828,13 +2861,15 @@ function renderSettings() {
 
                     <div class="ff4-vir-buttons">
                         <button id="ff4_vir_activate" class="menu_button" title="Force re-activate VIR lorebook in ST's Active Worlds list">⚓ Activate</button>
-                        <button id="ff4_vir_refresh" class="menu_button">⟳ Refresh</button>
+                        <button id="ff4_vir_refresh" class="menu_button">⟳ Refresh UI</button>
+                        <button id="ff4_vir_batch_refresh" class="menu_button" title="Re-run AI on EVERY character to update them all to the current template. One generation per character. Confirm before proceeding.">🔄 Refresh all chars</button>
                         <button id="ff4_vir_remind" class="menu_button" title="Force the next AI generation to be reminded of the VIR contract at maximum priority (depth 1, escalated). Useful when the AI starts skipping vir packets.">🔔 Remind AI</button>
                         <button id="ff4_vir_copy_debug" class="menu_button">Copy Debug</button>
                         <button id="ff4_vir_clear_warn" class="menu_button">Clear</button>
                         <button id="ff4_vir_export" class="menu_button">⬇ Export</button>
                         <label for="ff4_vir_import" class="menu_button">⬆ Import</label>
                         <input id="ff4_vir_import" type="file" accept="application/json" style="display:none">
+                        <button id="ff4_vir_reset_settings" class="menu_button" title="Reset all extension settings to their factory defaults (does NOT touch the lorebook).">⚙ Reset settings</button>
                         <button id="ff4_vir_reset" class="menu_button danger_button">⌫ Reset</button>
                     </div>
                 </div>
@@ -2910,6 +2945,51 @@ function renderSettings() {
     $('ff4_vir_export')?.addEventListener('click', exportCurrentVir);
     $('ff4_vir_import')?.addEventListener('change', function () { importVirFile(this.files?.[0]); this.value = ''; });
     $('ff4_vir_reset')?.addEventListener('click', resetCurrentChatVir);
+
+    // v6.1 — Batch refresh button
+    $('ff4_vir_batch_refresh')?.addEventListener('click', () => batchRefreshAllCharacters());
+
+    // v6.1 — Reset settings to defaults (does NOT touch lorebook)
+    $('ff4_vir_reset_settings')?.addEventListener('click', () => {
+        if (!confirm('Reset all extension settings to defaults? Your lorebook entries are untouched. This only affects toggles, sliders, and the template choice.')) return;
+        const st = extension_settings[EXT];
+        // Preserve per-world bindings + pinned + recall data — only reset prefs.
+        const keep = {
+            worldChatMap: st.worldChatMap,
+            pinnedCharacters: st.pinnedCharacters,
+            recallCharacters: st.recallCharacters,
+        };
+        extension_settings[EXT] = Object.assign({}, defaultSettings, keep);
+        saveSettingsDebounced();
+        renderSettings();
+        if (typeof toastr !== 'undefined') toastr.success('Settings reset to defaults.', 'FF4 VIR');
+    });
+
+    // v6.1 — Refresh-context slider
+    const turnsSlider = $('ff4_vir_refresh_turns');
+    const turnsLabel = $('ff4_vir_refresh_turns_val');
+    if (turnsSlider) {
+        turnsSlider.value = String(settings().refreshContextTurns ?? 20);
+        if (turnsLabel) turnsLabel.textContent = turnsSlider.value;
+        turnsSlider.addEventListener('input', function () {
+            settings().refreshContextTurns = parseInt(this.value) || 20;
+            if (turnsLabel) turnsLabel.textContent = this.value;
+            saveSettingsDebounced();
+        });
+    }
+
+    // v6.1 — Refresh-cooldown slider
+    const cooldownSlider = $('ff4_vir_refresh_cooldown');
+    const cooldownLabel = $('ff4_vir_refresh_cooldown_val');
+    if (cooldownSlider) {
+        cooldownSlider.value = String(Math.round((settings().refreshDebounceMs ?? 30000) / 1000));
+        if (cooldownLabel) cooldownLabel.textContent = cooldownSlider.value;
+        cooldownSlider.addEventListener('input', function () {
+            settings().refreshDebounceMs = (parseInt(this.value) || 30) * 1000;
+            if (cooldownLabel) cooldownLabel.textContent = this.value;
+            saveSettingsDebounced();
+        });
+    }
 
     updateStatus();
 }
@@ -3069,17 +3149,60 @@ async function renderCharacterList() {
         const matches = entryMatchesActiveTemplate(entry.content || '', activeTemplate);
         const mismatchBadge = matches ? '' :
             `<span class="ff4-vir-mismatch-badge" title="This entry is in a different template format than your active selection (${activeTemplate}). Click 🔄 to re-render.">↻ ${activeTemplate}?</span>`;
-        rows.push(`<div class="ff4-vir-char-row">
+        // v6.1 — token telemetry: show the actual rendered entry size in the
+        // completeness chip tooltip. Helps users gauge how close to the
+        // template's cap each entry is sitting.
+        const entryTokens = estimateTokens(entry.content || '');
+        const tokenInfo = `${entryTokens} tok in lorebook (current shape: ${entryRenderShape(entry.content || '')})`;
+        // v6.1 — disable refresh button while cooldown is active, show remaining time.
+        const locked = refreshIsLocked(name);
+        const lockedSecs = locked ? refreshSecondsRemaining(name) : 0;
+        const refreshTitle = locked
+            ? `Cooldown: wait ${lockedSecs}s before refreshing again.`
+            : `Re-run AI to refresh this character in the current template (${activeTemplate}).`;
+        // v6.1 — character row gets data-entry-preview for the hover tooltip.
+        // Stored URI-encoded so the HTML attribute can't be broken by quotes.
+        const preview = (entry.content || '').slice(0, 1500);
+        const previewAttr = encodeURIComponent(preview);
+        rows.push(`<div class="ff4-vir-char-row" data-entry-preview="${previewAttr}">
             <span class="ff4-vir-char-tier" style="color:${tierColor}">[${tier}]</span>
             <span class="ff4-vir-char-name">${escapeHtml(name)}</span>
-            <span class="ff4-vir-char-completeness" style="color:${pctColor}" title="VIR completeness — fraction of identity fields populated, weighted by importance">${pct}%</span>
+            <span class="ff4-vir-char-completeness" style="color:${pctColor}" title="VIR completeness ${pct}% — fraction of identity fields populated, weighted by importance.\n${tokenInfo}">${pct}%</span>
             ${mismatchBadge}
             ${color ? `<span style="color:${color};font-weight:600" title="Dialogue colour: ${color}">●</span>` : ''}
             <button class="ff4-vir-pin-btn menu_button" data-name="${escapeHtml(name)}" data-action="${pinned.has(name) ? 'park' : 'pin'}">${pinned.has(name) ? 'Unpin' : 'Pin'}</button>
-            <button class="ff4-vir-refresh-btn menu_button" data-name="${escapeHtml(name)}" title="Re-run AI to refresh this character in the current template">🔄</button>
+            <button class="ff4-vir-refresh-btn menu_button" data-name="${escapeHtml(name)}" title="${escapeHtml(refreshTitle)}" ${locked ? 'disabled' : ''}>🔄</button>
         </div>`);
     }
     container.innerHTML = rows.join('');
+
+    // v6.1 — hover tooltip showing the full rendered entry content.
+    // Attached once; reuses a single popover element.
+    let _previewPopover = document.getElementById('ff4_vir_preview_popover');
+    if (!_previewPopover) {
+        _previewPopover = document.createElement('div');
+        _previewPopover.id = 'ff4_vir_preview_popover';
+        _previewPopover.className = 'ff4-vir-preview-popover';
+        document.body.appendChild(_previewPopover);
+    }
+    container.querySelectorAll('.ff4-vir-char-row[data-entry-preview]').forEach(row => {
+        row.addEventListener('mouseenter', () => {
+            const text = decodeURIComponent(row.getAttribute('data-entry-preview') || '');
+            if (!text) return;
+            _previewPopover.textContent = text;
+            _previewPopover.style.display = 'block';
+            // Position to the right of the row (or below if no room).
+            const rect = row.getBoundingClientRect();
+            const popW = Math.min(420, window.innerWidth - 40);
+            _previewPopover.style.maxWidth = popW + 'px';
+            const left = Math.min(rect.right + 12, window.innerWidth - popW - 10);
+            _previewPopover.style.left = Math.max(10, left) + 'px';
+            _previewPopover.style.top = (rect.top + window.scrollY) + 'px';
+        });
+        row.addEventListener('mouseleave', () => {
+            _previewPopover.style.display = 'none';
+        });
+    });
     container.querySelectorAll('.ff4-vir-pin-btn').forEach(btn => {
         btn.addEventListener('click', async () => {
             const name = btn.getAttribute('data-name');
@@ -3127,9 +3250,49 @@ async function renderCharacterList() {
 // preserving established identity facts and incorporating any visible changes
 // from recent chat history. Only that one character's entry is touched.
 const REFRESH_DEFAULT_CONTEXT_TURNS = 20;
+// v6.1 — per-character debounce so click-spam doesn't burn tokens.
+// Map: characterName (lowercase) → unix-ms of last successful refresh.
+const _refreshLastSuccess = new Map();
+let _batchRefreshActive = false;
+function refreshIsLocked(name) {
+    const cooldownMs = settings().refreshDebounceMs || 30000;
+    const last = _refreshLastSuccess.get(String(name || '').toLowerCase());
+    if (!last) return false;
+    return (Date.now() - last) < cooldownMs;
+}
+function refreshSecondsRemaining(name) {
+    const cooldownMs = settings().refreshDebounceMs || 30000;
+    const last = _refreshLastSuccess.get(String(name || '').toLowerCase());
+    if (!last) return 0;
+    return Math.max(0, Math.ceil((cooldownMs - (Date.now() - last)) / 1000));
+}
 
+// v6.1 — read chat tail size from settings; clamp to sane bounds.
+function getRefreshContextTurns() {
+    const n = parseInt(settings().refreshContextTurns);
+    if (Number.isFinite(n) && n >= 0 && n <= 80) return n;
+    return REFRESH_DEFAULT_CONTEXT_TURNS;
+}
+function buildChatTailForRefresh() {
+    try {
+        const ctx = getContext();
+        const chat = Array.isArray(ctx?.chat) ? ctx.chat : [];
+        const n = getRefreshContextTurns();
+        if (n <= 0 || !chat.length) return '';
+        const slice = chat.slice(-n);
+        return slice.map((m) => {
+            if (!m) return '';
+            const who = m.is_user ? '[USER]' : m.is_system ? '[SYS]' : `[${m.name || 'AI'}]`;
+            return `${who} ${String(m.mes || '').replace(/\s+/g, ' ').slice(0, 800)}`;
+        }).filter(Boolean).join('\n');
+    } catch (e) {
+        warn('buildChatTailForRefresh failed', e?.message);
+        return '';
+    }
+}
 function buildRefreshContract(name, templateMode, existingContent) {
     const mode = resolveTemplateMode(templateMode);
+    const tail = buildChatTailForRefresh();
     return [
         `You are refreshing the Visual Identity Registry (VIR) sheet for ONE character.`,
         '',
@@ -3152,11 +3315,18 @@ function buildRefreshContract(name, templateMode, existingContent) {
         `EXISTING VIR SHEET FOR ${name}:`,
         existingContent || '(no existing entry — create from chat context)',
         '',
-    ].join('\n');
+        tail ? `RECENT CHAT (last ${getRefreshContextTurns()} messages):` : '',
+        tail,
+    ].filter(Boolean).join('\n');
 }
 
-async function refreshCharacterViaAI(name) {
+async function refreshCharacterViaAI(name, opts = {}) {
     if (!name) throw new Error('character name required');
+    // v6.1 — debounce check; opts.bypassDebounce lets batch refresh skip it.
+    if (!opts.bypassDebounce && refreshIsLocked(name)) {
+        const secs = refreshSecondsRemaining(name);
+        throw new Error(`${name} was just refreshed (cooldown ${secs}s)`);
+    }
     const worldName = currentWorldName();
     if (!worldName) throw new Error('no active chat');
     const ctx = getContext();
@@ -3272,10 +3442,71 @@ async function refreshCharacterViaAI(name) {
     upsertCharacter(data, name, { vir: newVir });
     await saveWorldInfo(worldName, data, true);
     await updateWorldInfoList();
+    // v6.1 — record success timestamp for debounce.
+    _refreshLastSuccess.set(String(name).toLowerCase(), Date.now());
     log(`Refresh: ${name} updated`);
-    if (typeof toastr !== 'undefined') {
+    if (typeof toastr !== 'undefined' && !opts.silent) {
         toastr.success(`Refreshed ${name}`, 'FF4 VIR', { timeOut: 3000 });
     }
+}
+
+// v6.1 — batch refresh: iterate all characters sequentially. Per-char
+// debounce is bypassed (the user explicitly opted in by clicking "Refresh
+// all"). Progress is reported via a single sticky toastr that updates as
+// each character completes. Aborts cleanly on first error.
+async function batchRefreshAllCharacters() {
+    if (_batchRefreshActive) {
+        if (typeof toastr !== 'undefined') toastr.info('Batch refresh already running.', 'FF4 VIR');
+        return;
+    }
+    const worldName = currentWorldName();
+    if (!worldName) {
+        if (typeof toastr !== 'undefined') toastr.warning('No active chat.', 'FF4 VIR');
+        return;
+    }
+    const data = await loadWorldInfo(worldName);
+    if (!data) {
+        if (typeof toastr !== 'undefined') toastr.error('Could not load lorebook.', 'FF4 VIR');
+        return;
+    }
+    const chars = characterEntries(data).map(([, e]) => characterEntryName(e)).filter(Boolean);
+    if (!chars.length) {
+        if (typeof toastr !== 'undefined') toastr.info('No characters to refresh.', 'FF4 VIR');
+        return;
+    }
+    if (!confirm(`Refresh ${chars.length} character(s)? This will send one AI generation per character (≈${chars.length} extra generations).`)) return;
+
+    _batchRefreshActive = true;
+    const errors = [];
+    let progressToast = null;
+    try {
+        for (let i = 0; i < chars.length; i++) {
+            const name = chars[i];
+            if (typeof toastr !== 'undefined') {
+                if (progressToast?.toastId) toastr.clear(progressToast);
+                progressToast = toastr.info(`Refreshing ${i + 1}/${chars.length}: ${name}…`, 'FF4 VIR', { timeOut: 0 });
+            }
+            try {
+                await refreshCharacterViaAI(name, { bypassDebounce: true, silent: true });
+            } catch (err) {
+                errors.push(`${name}: ${err?.message || err}`);
+                warn(`Batch refresh failed for ${name}:`, err);
+            }
+        }
+    } finally {
+        _batchRefreshActive = false;
+        if (progressToast && typeof toastr !== 'undefined') toastr.clear(progressToast);
+    }
+    if (typeof toastr !== 'undefined') {
+        if (errors.length) {
+            toastr.warning(`Batch refresh complete with ${errors.length} error(s). See console.`, 'FF4 VIR', { timeOut: 8000 });
+            console.warn(`[${EXT}] Batch refresh errors:`, errors);
+        } else {
+            toastr.success(`Batch refresh complete: ${chars.length} character(s) refreshed.`, 'FF4 VIR', { timeOut: 5000 });
+        }
+    }
+    renderCharacterList();
+    updateStatus();
 }
 
 // ============================================================================
