@@ -96,7 +96,11 @@ const defaultSettings = {
     bindToChat: true,
     cleanupOnChatDelete: true,
     smartTiers: true,                // recommended: dynamic constant flag per scene
-    contractInjection: true,         // auto-inject VIR contract via setExtensionPrompt
+    contractInjection: false,        // DEPRECATED legacy path. The v6 design carries the
+                                     // contract via the constant "FF4 VIR Rules" lorebook
+                                     // entry. Leaving this on duplicates the full ~3k-token
+                                     // contract (setExtensionPrompt copy + lorebook copy) at
+                                     // the same depth every turn. Keep false.
     seedUserPersona: true,           // auto-seed a pinned VIR entry from the active persona
     recallTurnsDefault: 8,           // longer than v4 for better long-term memory
     templateMode: 'Detailed',
@@ -2512,9 +2516,15 @@ async function handleGenerationEnded() {
                 // True miss — AI sent a substantive reply with no vir content at all
                 const wordCount = (msg.mes || '').trim().split(/\s+/).length;
                 if (wordCount > 40) {
-                    st.consecutiveMisses = (st.consecutiveMisses || 0) + 1;
+                    // Cap the streak so the escalation stabilises instead of
+                    // running away to "your last 905 replies skipped…". Past the
+                    // cap the model clearly isn't emitting the fence (often it's
+                    // landing in stripped reasoning); screaming a bigger number
+                    // only bloats the prompt and makes things worse.
+                    const MISS_CAP = 5;
+                    st.consecutiveMisses = Math.min(MISS_CAP, (st.consecutiveMisses || 0) + 1);
                     st.totalMisses = (st.totalMisses || 0) + 1;
-                    warn(`VIR miss #${st.consecutiveMisses} (total ${st.totalMisses}) — escalating depth-1 reminder`);
+                    warn(`VIR miss #${st.consecutiveMisses} (cap ${MISS_CAP}, total ${st.totalMisses}) — escalating depth-1 reminder`);
                 }
             }
             saveSettingsDebounced();
@@ -3285,7 +3295,7 @@ function renderSettings() {
     // skipping vir packets in long sessions.
     $('ff4_vir_remind')?.addEventListener('click', async () => {
         const st = settings();
-        st.consecutiveMisses = Math.max(3, (st.consecutiveMisses || 0) + 1);
+        st.consecutiveMisses = Math.min(5, Math.max(3, (st.consecutiveMisses || 0) + 1));
         saveSettingsDebounced();
         await injectVirContract();
         if (typeof toastr !== 'undefined') {
