@@ -221,161 +221,67 @@ function buildVirBudgetBlock() {
 // character that looks different in every image. The contract teaches the
 // model what detail each field needs and why. Preset-level rules (color
 // palette, output order, FORBIDDEN/CORRECT) still live in the user's preset.
-const VIR_CONTRACT = `[VIR TRACKING CONTRACT — visual identity registry]
-
-End EVERY reply with exactly one \`\`\`vir code-fence block in the visible message — placed AFTER prose, AFTER all <pic> tags, AFTER the STATS UPDATE section. If another tracker code-fence is also required (e.g. \`\`\`rpg from an RPG STATE TRACKER), that other tracker takes the FINAL slot and \`\`\`vir comes immediately before it. VIR's parser does not care about absolute final position — it only needs to find \`\`\`vir somewhere in the visible reply. One line of flat JSON, schema 3:
+const VIR_CONTRACT = `[VIR — visual identity registry]
+Every reply ends with ONE \`\`\`vir code-fence in the VISIBLE message (never in reasoning / <think> / <details>), after prose, after <pic> tags, after the STATS UPDATE section. If another tracker fence (e.g. \`\`\`rpg) needs the final slot, put \`\`\`vir immediately before it. One line of flat JSON, schema 3:
 {"schema":3,"characters":[{"name":"...","action":"create|update",<flat fields>}],"scene":{"location":"...","time":"...","active":"Name1,Name2"},"states":[{"name":"...","position":"...","aftermath":0}],"recall":[]}
-Flat name-keyed objects only — never nest objects under a name, never nest voice_lock. Multi-piece fields (outfit, accessories, equipment, underwear) are SEMICOLON-separated strings.
+Flat name-keyed objects only, never nested. Multi-piece fields (outfit, underwear, accessories, equipment) are ONE semicolon-separated string.
 
-WHY DETAIL MATTERS: the VIR is the single source of truth that every <pic> tag copies from. If a field is vague, the image generator invents something different each pic and the character looks inconsistent across images. Every field must be specific enough that two different pics, generated hours apart, render the SAME character.
+WHY: the VIR is the single source every <pic> copies. A vague field = the image model invents it differently each pic; each field must be specific enough that two pics made hours apart render the SAME character. Write all values in plain simple words a child knows (they feed a small image encoder) — colour + material + item + shape. No literary/rare words, no vague labels ("casual outfit", bare "green eyes").
 
-PER-CHARACTER FIELDS:
+STABLE FIELDS (emit fully on 'create'; change only when the STORY explicitly causes it):
+- full_name: canon/card name, not a nickname.
+- species: e.g. "adult human female", "anthro arctic fox male", "slime girl".
+- source: canon franchise name, or exactly "original character". Never invent a source.
+- age_appearance, height, build: "looks mid-20s", "168 cm", "slim hourglass".
+- body_material: WHAT THE BODY IS MADE OF — MANDATORY for any non-human (the #1 wrong-render cause): substance + texture + behaviour. slime→"translucent blue-green gel, jiggly, no skeleton, light refracts through, wet sheen"; dryad→"living bark, birch torso, leaf-and-vine hair, twig fingertips"; ghost→"semi-transparent vapour, lower body fades to mist". Ordinary human → leave empty.
 
-STABLE FIELDS (emit fully on first 'create'; only change when the STORY explicitly causes it — same causality rule as stat deltas: no story event = no change):
-- full_name: full canon/display name if known. Use the show/card/original character name, not a short nickname.
-- species: e.g. "adult human female", "anthro arctic fox male", "slime girl", "dryad"
-- source: full canon franchise/show/game/VN/source name, or exactly "original character" if the character has no source. Do not invent a source.
-- age_appearance, height, build: "looks mid-20s", "168 cm", "slim hourglass, soft tummy"
-- body_material: WHAT THE BODY IS MADE OF. MANDATORY for any non-human species — this is the #1 cause of wrong renders. A slime girl is NOT a human with coloured skin; a dryad is NOT a human with green skin. State the substance + texture + how it behaves:
-    slime girl  → "entire body is translucent blue-green gel, soft and jiggly, no skeleton, deformable, light refracts through her, surface glistens wet"
-    dryad       → "body is living wood and bark, smooth pale birch torso, mossy patches at the joints, hair is a cascade of real leaves and small vines, fingers end in twig-like tips"
-    ghost       → "semi-transparent pale vapour, lower body fades to mist, no solid mass, faint inner glow"
-    For an ordinary human, leave body_material empty.
-Use plain simple words for all fields — the kind a child knows. No fancy or rare words.
-DETAIL FLOOR — EVERY anchor below must be filled per character. Vague values cause "looks different in every pic". Aim for 6-10 concrete attributes per visual field, not 2-3. Specific words beat generic ones (chocolate-brown > brown, mid-calf > tall, twelve-eyelet lace-up > laced).
+DETAIL FLOOR — fill EVERY anchor, 6-10 concrete attributes per visual field, specific words (chocolate-brown > brown, mid-calf > tall):
+- hair: shade + length-to-landmark + texture + styling + parting + fringe + distinguishing detail.
+- eyes: shade + secondary tone + shape + size + lashes + distinguishing detail.
+- skin: tone + undertone + texture + marks. (fur/scales: colour zones + texture + markings.)
+- face_features: nose + cheeks + lips + jaw + chin + ears + brow + micro-features.
+- body: shoulders + chest + waist + hips + arms + legs.
+- marks: type + size + shape + EXACT placement + colour + healing.
+- non_human: type + size + colour + placement + distinguishing detail (ears, tail, horns, wings, lower-body, etc.).
 
-- hair: shade + length to a body landmark + texture + styling + parting + fringe/bang + distinguishing detail.
-    DETAIL FLOOR: "honey-blonde with lighter sun-bleached tips, falls to mid-back when down, straight with a slight wave at the ends, parted on the right, side-swept fringe brushing the brow, one thin braid behind the left ear"
-    TOO THIN (do not write this): "long blonde, straight, with a fringe"
-- eyes: specific shade + secondary tone + shape + size + lash detail + distinguishing detail.
-    DETAIL FLOOR: "warm forest-green with a darker emerald ring around the iris, almond-shaped, slightly upturned at the outer corner, average size, long thick natural lashes, faint laugh lines at the outer corner"
-    TOO THIN: "green, round"
-- skin: specific tone + undertone + texture + distinguishing skin features.
-    DETAIL FLOOR: "warm light-olive skin with peach undertone, smooth except for a small constellation of light freckles across the bridge of the nose and onto both cheekbones, faint tan line at the upper arms"
-    For fur/scales: "soft burnt-orange fur over the back and head fading to cream on the chest and belly, sleek short fur with longer ruff at the neck, three thin darker brown stripes on the upper arms"
-    TOO THIN: "tan skin" / "orange fur"
-- face_features: nose + cheeks + lips + jaw + chin + ears (if not non_human) + brow + distinguishing micro-features.
-    DETAIL FLOOR: "small straight nose with a slight upturn at the tip, soft full cheeks, naturally rosy heart-shaped lips with a defined cupid's bow, narrow rounded jaw, small pointed chin, small attached earlobes, slim natural brow with a small mole at the outer end of the left one"
-    TOO THIN: "small nose, round cheeks, thin lips"
-- body: shoulders + chest + waist + hips + arms + legs + posture-relevant details.
-    DETAIL FLOOR: "narrow sloping shoulders, full C-cup breasts with a small natural sag, defined narrow waist (hourglass ratio), wide rounded hips, slender arms with soft definition, long shapely legs with toned thighs and slim calves"
-    TOO THIN: "medium breasts, narrow waist, wide hips"
-- marks: type + size + exact shape + EXACT placement (which side, where relative to anatomical landmarks) + colour + age/healing.
-    DETAIL FLOOR: "thin pale-pink one-inch crescent scar two cm above the outer end of the left eyebrow, faded and slightly raised; small dark-brown round mole on the right cheek halfway between the corner of the mouth and the ear; black-ink five-pointed star tattoo on the inside of the left wrist, two cm wide, fully healed and saturated"
-    TOO THIN: "scar above eyebrow"
-- non_human: type + size + colour + placement + distinguishing detail.
-    DETAIL FLOOR: "long pointed cat ears set high on the head, soft inner fur a paler pink-cream, outer fur matching her hair colour, the left ear has a small notch on its outer edge; long fluffy fox tail starting at the base of the spine, the same orange as her hair fading to a white tip, held with a slight upward curve at the base"
-    TOO THIN: "pointed cat ears, long fluffy tail"
+PERSISTENCE (anti-drift): every value persists unchanged until you emit an explicit update. No update this turn = identical to last turn; copy it forward. Fields never silently gain/lose content — an established scar or glasses stays; an item never in the VIR never appears. The VIR records what the story established, not a creative canvas.
 
-FIELD PERSISTENCE — THE ANTI-DRIFT RULE:
-Every field value, once written, persists unchanged until you emit an explicit update for it. If you did not write an update this turn, the field is identical to last turn — copy it forward unchanged. A field does not silently gain or lose content. Glasses that appeared last turn stay on. Glasses never mentioned stay off. A scar that was established stays. An accessory not in the VIR does not appear. The VIR is a record of what the story established, not a creative canvas.
+CURRENT STATE (update the moment it changes):
+- hair_state: how hair sits now ("high ponytail", "wet, flat on shoulders").
+- outfit: EVERY piece, semicolon-separated, FULL anchors per piece — colour + material + item + cut/sleeve/neckline + fit + length + closure + detail. Footwear ALWAYS: height + closure + heel + toe. No labels, no 3-anchor stubs.
+- underwear: same anchor depth as outfit.
+- accessories: type + material + colour + placement + size, per item. Omit the field if none; never invent.
+- equipment/holding: same depth ("weathered short sword, dark-brown scabbard, left hip, brass oak-leaf pommel").
+- pose: short posture ("standing at counter, right hand flat, looking left").
+- expression: simple ("small smile, eyes narrow, head tilted right").
+- condition: every visible transient mark now, semicolon-separated ("sweat on brow; smeared lipstick; bruise on left cheek").
+- location_context: where they stand/sit.
 
-CURRENT STATE (update the MOMENT it changes — this is what keeps pics consistent):
+TRACK {{user}} TOO (overrides the usual skip-the-PC convention) so the player renders consistently in <pic>:
+- Include {{user}} by their actual name. First appearance → action:"create" with every field you can establish.
+- Draft {{user}}'s look from CURRENT CONTEXT ONLY: (1) active persona if visual, (2) card/scenario/first-message/visible evidence, (3) neutral genre-fit defaults. Never pull from other personas/chats/sessions.
+- Never leave {{user}}'s immutables (species, age, build, hair, eyes, skin) blank — pick plausible and KEEP FIXED. Update only on visible change.
 
-FIELD QUALITY RULE: write every field value in short, plain, simple words — the kind a child knows. The values feed a small image encoder that cannot handle rare or fancy words. Colour + basic material + item name + simple shape is enough. No literary words.
+ACTIONS: 'create' = first appearance, ALL known fields. 'update' = ONLY changed fields (undress → outfit/underwear/condition). Nothing visual changed → omit that character. {{user}} gets 'create' as soon as the story gives any basis.
 
-- hair_state: how the hair sits RIGHT NOW — "tied up in a high ponytail", "wet and flat against her shoulders", "loose and messy with strands in her face"
-- outfit: EVERY worn piece, semicolon-separated, with the FULL anchor set per piece — colour shade + material + item type + cut/sleeve/neckline + fit + length + closure/fastening + distinguishing detail. The model paints what the words paint; if a piece has only 3 anchors, the model invents the other 5 differently every pic.
-    DETAIL FLOOR (good): "chocolate-brown distressed buttery leather vest, fitted at the waist, asymmetric front zip with brass teeth running from right hip up to the left collarbone, two slim chest pockets, sleeveless with a narrow lapel; cream-white linen long-sleeve shirt under the vest, banded collar, sleeves rolled to mid-forearm showing the inner cuff; charcoal-grey wool trousers, slim straight leg, ankle-length with no cuff, sits at the natural waist, plain front no pleats; warm tan distressed leather boots, mid-calf height ending two finger-widths below the knee, twelve-eyelet front lace-up crossed in an X pattern with leather cord, low block heel, rounded toe, slight scuff on the right toe cap"
-    TOO THIN (do NOT write): "brown leather vest; white shirt; dark grey pants; tall brown boots" — every word here is a hole the model fills differently each render.
-    BAD (NEVER): "practical adventurer clothes" / "casual outfit" / "leather top and pants" / "boots" — these are not pieces, they are labels.
-    For footwear specifically, ALWAYS include: height (ankle / mid-calf / knee-high / over-the-knee / thigh-high) + closure (lace-up with N eyelets / side-zip / slip-on / buckle) + heel (flat / low block / mid stiletto / chunky platform) + toe (round / pointed / square / open).
-- underwear: same detail floor as outfit. "matte black satin bra with thin spaghetti straps, half-cup balconette shape, thin lace trim along the upper edge, small bow at the centre; matching matte black satin high-cut briefs, mid-rise, thin bow at each hip"
-    TOO THIN: "black bra; black underwear"
-- accessories: type + material + colour + placement (which finger/ear/wrist/neck) + size + distinguishing detail. Per-item, semicolon-separated.
-    DETAIL FLOOR: "small polished silver hoop earrings, eight mm diameter, one in the lower lobe of each ear; thin antique-brass twisted-rope belt around the natural waist, oval buckle stamped with a leaf motif, belt holes punched at regular intervals; plain matte gold band ring on the right ring finger, three mm wide"
-    TOO THIN: "silver earrings; leather belt; ring"
-    If none worn: omit the field entirely. NEVER invent.
-- equipment / holding: same — "weathered short sword in a worn dark-brown leather scabbard belted at the left hip, brass pommel shaped like an oak leaf"; "white ceramic mug filled with dark coffee, gripped in the right hand by the handle"
-- pose: plain posture in a few short words — "standing at the counter, right hand flat on the top, looking left"
-- expression: face in simple words — "small smile, eyes a little narrow, head tilted right"
-- condition: every visible mark right now — "sweat on forehead; lipstick smeared on lower lip; small bruise on left cheek; mud on right boot"
-- location_context: where they stand or sit — "sitting on the left side of a wood booth, facing the door"
+[WORLD SIMULATION] Each turn, BEFORE the reply, advance ALL tracked characters — on AND off screen. For each off-screen one: what have they done or suffered since the last scene? The world did not pause. Anything plausible can happen (train, worsen, heal, grieve, get drunk/robbed/arrested/killed, change clothes, lose gear). Base it on their last state, location, goals, personality, conditions, and time elapsed. Any resulting change — stats, outfit, injury, recovery, mood, gear, death — goes into STATS UPDATE and their VIR 'update', same as an on-screen character.
 
-TRACK {{user}} TOO — THE PLAYER CHARACTER:
-Standard RP convention has you describe only NPCs and skip {{user}}. This contract OVERRIDES that. {{user}} also needs a VIR entry so they render consistently in <pic> tags.
-- Include {{user}} in the characters array, using their actual name (not the literal text "{{user}}").
-- First appearance: emit action:"create" for {{user}} with every identity field you can establish.
-- DRAFT {{user}}'s appearance from CURRENT CONTEXT ONLY. Priority: (1) active persona description if it has visual detail; (2) current card, scenario, first message, and visible story/chat evidence; (3) reasonable neutral defaults that fit the current setting and genre. Do NOT use other saved personas, unrelated chats, memory from other sessions, or old profiles.
-- NEVER leave {{user}}'s immutable fields (species, age_appearance, build, hair, eyes, skin) blank. If the story genuinely never says, pick something plausible for the setting and KEEP IT FIXED — once created, {{user}}'s immutable fields never change, exactly like an NPC.
-- After 'create', emit 'update' for {{user}} only when something visibly changes (outfit, pose, condition) — same rule as everyone else.
-
-ACTIONS: 'create' = first appearance, emit ALL known fields. 'update' = emit ONLY the fields that changed this turn. If a character undresses, emit an update with the new outfit/underwear/condition. If nothing visual changed for a character, omit them from the packet entirely. EXCEPTION: {{user}} must get a 'create' as soon as the story gives any basis for their look — do not wait or skip them.
-
-[WORLD SIMULATION]
-You are the game master of a living world. Every turn, BEFORE writing the reply, advance ALL tracked characters simultaneously — not just those in the current scene.
-
-For each off-screen character, ask: what has this person been doing since the last scene? What happened to them? The world did not pause while the camera was elsewhere. They lived, acted, suffered, healed, chose, and changed. Simulate it honestly — anything can happen. A character can get stronger, weaker, poisoned, cured, heartbroken, drunk, arrested, robbed, or killed. They can change clothes, lose equipment, gain allies, fall in love, or quietly give up. There are no forbidden outcomes. Let the world be real.
-
-Base the simulation on: their last known state and VIR entry, their location, goals, personality, any active conditions, and the in-world time elapsed. A warrior alone in camp probably trains. A poisoned rogue without a healer gets worse. A grieving character might not eat. A resourceful one finds a way. A person with enemies isn’t safe just because the camera looked away. Follow the logic of who they are and what the world would plausibly do to them.
-
-Whatever happened to an off-screen character this turn — stat changes, outfit changes, injuries, recoveries, emotional shifts, equipment lost or gained, death — goes into STATS UPDATE and into their VIR ‘update’ entry, exactly like an on-screen character. A character does not need to appear in the prose to receive updates. Their story runs in parallel.
-
-[STATS TRACKER]
-Stats are the numeric layer of the world simulation. The exact stat list per character lives in their card / persona; system rules in “SYSTEM: Stats”; event triggers in “SYSTEM: Stat Events”. Never invent stats outside those entries.
-
-VISIBLE OUTPUT (mandatory every reply):
-End the visible reply (after prose, after all <pic> tags, BEFORE the \`\`\`vir block) with this exact section:
-
+[STATS TRACKER] Stats live in the card/persona; rules in "SYSTEM: Stats"; triggers in "SYSTEM: Stat Events". Never invent stats outside those. EVERY reply, after prose+pics and before \`\`\`vir, emit:
   ─── STATS UPDATE ───
-  **CharacterName**
-    • StatName oldValue → newValue — one-line reason
-  **OtherCharacter**
-    • StatName old → new — reason
+  **Name**
+    • Stat old → new — concrete reason (a real event this turn)
+If nothing changed for anyone, still emit the header + "*No stats changed this turn.*". Never skip it (a reply without it is malformed). Every bullet needs a real-event reason (no cause = no delta). Use actual names.
 
-Use each character’s actual name. Use {{user}}’s actual name, not the literal “{{user}}”.
+[STATS → VISUAL LINK] Any stat delta MUST also update that character's \`\`\`vir transient fields (condition/pose/expression). Immutables (build, body, hair, eyes, marks, body_material) stay locked — stats change appearance-of-state, not anatomy. Baseline mapping (extend via each stat's visual_effect in "SYSTEM: Stats"):
+  STR↓ slumped shoulders, arms loose | STR↑ squared shoulders, weight forward
+  STA↓ heavy breathing, sweat, pale, leaning for support | STA↑ steady, clear-eyed
+  HP↓ the actual injury (bruise/blood/limp), favouring the hurt side
+  COMPOSURE↓ tight jaw, wet eyes, shaking | COMPOSURE↑ calm half-smile
+  TRUST(X)↑ angled toward X, soft eye contact | TRUST(X)↓ stiff, gaze averted
+  AROUSAL↑ flushed, dilated pupils, sweat sheen | AROUSAL↓ clear, no flush
+For unlisted stats use visual_effect, else a posture a viewer reads as more/less of it. RECOVERY: when a stat returns to baseline, CLEAR the matching descriptors (don't just stop adding) or the character looks exhausted forever.
 
-IF NOTHING CHANGED FOR ANYONE, still emit:
-  ─── STATS UPDATE ───
-  *No stats changed this turn.*
-NEVER silently skip it. A reply without STATS UPDATE is malformed.
-
-THE REASON IS MANDATORY:
-Every bullet needs “— reason” — a concrete thing that happened (“took the blast for her”, “ran twelve hours through the storm”, “three days without food”). No filler. No cause → no delta.
-
-[STATS → VISUAL LINK]
-Stats are not just numbers — they shape how a character LOOKS right now. Any stat delta you emit in the STATS UPDATE block MUST also produce a matching update inside this turn’s \`\`\`vir block, on that character’s entry. Land the effect in the existing transient-state fields: condition, pose, expression. Immutable identity fields (build, body, hair, eyes, marks, body_material) stay locked per the rules above — never modify them for a stat change. Stat changes affect APPEARANCE OF state, not anatomy.
-
-This is what makes <pic> tags actually reflect the state. Without this link a Stamina drop is just a number — the rendered image stays fresh.
-
-MAPPING BASELINE (extend in "SYSTEM: Stats" → visual_effect field per stat):
-
-  STRENGTH ↓   pose: "shoulders slumped, arms hanging loose"
-               condition: "muscles trembling under exertion"
-  STRENGTH ↑   pose: "shoulders squared, chest open, weight forward"
-
-  STAMINA ↓    condition: "breathing heavy, sweat on brow, face pale"
-               pose: "leaning on the wall for support"
-  STAMINA ↑    condition: "steady breathing, clear-eyed"
-
-  HEALTH ↓     condition: actual injury from the event — "bruise forming on left cheek, blood on knuckles, limping"
-               pose: "favouring the injured side, hand pressed to ribs"
-
-  COMPOSURE ↓  expression: "jaw tight, eyes wet, hands shaking"
-  COMPOSURE ↑  expression: "calm half-smile, level gaze"
-
-  TRUST(X) ↑   pose: "body angled toward X, soft eye contact"
-  TRUST(X) ↓   pose: "stiff posture toward X, gaze averted"
-
-  AROUSAL ↑    condition: "flushed cheeks, dilated pupils, sheen of sweat"
-  AROUSAL ↓    condition: "(clear — no arousal flush)"
-
-For stats not in this list, read the visual_effect field from the "SYSTEM: Stats" lorebook. If a stat has none, choose a posture or condition a viewer would read as "more / less of that stat".
-
-Multi-piece field syntax matches everywhere else in this contract — semicolon-separated:
-  condition: "breathing heavy; bruise forming on left cheek; sweat on brow"
-
-RECOVERY:
-When a stat moves back toward baseline (rest, healing, comfort), CLEAR the matching descriptors from condition/pose — don’t just stop adding new ones, or the character stays visually exhausted forever.
-
-[FINAL CHECK — DO THIS RIGHT BEFORE SENDING]
-1. Does your reply contain a \`\`\`vir code-fence in the VISIBLE message (not in reasoning, not in <details>), placed AFTER prose, AFTER pic tags, AFTER STATS UPDATE? \`\`\`vir does NOT have to be the absolute last block if another tracker (e.g. \`\`\`rpg) also requires the last slot — in that case let the other tracker close the message and put \`\`\`vir just before it. (Yes/no)
-2. Does it ALSO contain a "─── STATS UPDATE ───" section, placed just before that \`\`\`vir block? (Yes/no)
-3. If any stat moved this turn, does every bullet have a one-line reason citing a concrete event from THIS turn?
-4. If any stat moved, did the SAME deltas also produce a condition / pose / expression update inside the \`\`\`vir block for that character?
-5. If no stats moved, did you still emit the STATS UPDATE section with "*No stats changed this turn.*"?
-A "no" to any of these means the reply is malformed — fix before sending.
-A stats or vir block that exists only in your reasoning / thinking does NOT count. It must appear in the final visible message.`;
+[FINAL CHECK] (1) \`\`\`vir present in the VISIBLE reply, after prose/pics/STATS, correct slot vs other trackers? (2) STATS UPDATE section just before it? (3) every moved stat has a real-event reason? (4) every moved stat mirrored into that char's vir condition/pose/expression? (5) no change → "*No stats changed this turn.*" still emitted? A block that exists only in reasoning does NOT count — it must be in the final visible message.`;
 
 // ============================================================================
 // SETTINGS / LOGGING
