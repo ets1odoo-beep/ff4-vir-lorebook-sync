@@ -231,7 +231,7 @@ WHY: the VIR is the single source every <pic> copies. A vague field = the image 
 STABLE FIELDS (emit fully on 'create'; change only when the STORY explicitly causes it):
 - full_name: canon/card name, not a nickname.
 - species: e.g. "adult human female", "anthro arctic fox male", "slime girl".
-- source: canon franchise name, or exactly "original character". Never invent a source.
+- source: REQUIRED. The full canon SHOW/series/franchise/game name the character is from, exactly as an image model would know it (e.g. "Demon Slayer", "Naruto", "One Piece", "Genshin Impact"). This is the showname that triggers the right likeness in every <pic> ("Nezuko Kamado from Demon Slayer"). If the character belongs to no franchise (an OC / your own / {{user}}'s persona), set it to exactly "original character". Never invent, guess, or leave blank.
 - age_appearance, height, build: "looks mid-20s", "168 cm", "slim hourglass".
 - body_material: WHAT THE BODY IS MADE OF — MANDATORY for any non-human (the #1 wrong-render cause): substance + texture + behaviour. slime→"translucent blue-green gel, jiggly, no skeleton, light refracts through, wet sheen"; dryad→"living bark, birch torso, leaf-and-vine hair, twig fingertips"; ghost→"semi-transparent vapour, lower body fades to mist". Ordinary human → leave empty.
 
@@ -252,7 +252,7 @@ CURRENT STATE (update the moment it changes):
 - underwear: same anchor depth as outfit.
 - accessories: type + material + colour + placement + size, per item. Omit the field if none; never invent.
 - equipment/holding: same depth ("weathered short sword, dark-brown scabbard, left hip, brass oak-leaf pommel").
-- pose: short posture ("standing at counter, right hand flat, looking left").
+- pose: this character's OWN posture only ("standing at counter, right hand flat, looking left"). SELF-ONLY — never mention another character or a touch/contact verb here (no "cupping her chin", "leaning to his ear", "hand on his chest"); who-touches-whom belongs in scene/states, not in pose, so a <pic> never bakes contact into a single character's block.
 - expression: simple ("small smile, eyes narrow, head tilted right").
 - condition: every visible transient mark now, semicolon-separated ("sweat on brow; smeared lipstick; bruise on left cheek").
 - location_context: where they stand/sit.
